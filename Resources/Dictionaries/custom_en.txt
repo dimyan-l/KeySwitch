@@ -1,0 +1,11 @@
+# Свои английские слова: IT, бизнес, бренды, сокращения. Одно слово на строку.
+sql tsql t-sql dba dbas dwh etl elt bi ssis ssrs ssas olap oltp mssql mysql postgres postgresql pg oracle mongodb redis
+snowflake databricks bigquery redshift synapse fabric powerbi power tableau looker dbt airflow kafka spark hadoop
+azure aws gcp ec2 rds s3 iam vpc devops devsecops sre k8s kubernetes docker terraform ansible helm jenkins gitlab github
+ci cd cicd api apis rest graphql grpc json yaml xml csv crm erp saas paas iaas b2b b2c smb mvp poc kpi okr sla slo nda msa sow rfp rfi
+cto cio ceo cfo coo cpo cmo ciso vp hr qa aqa sdet ui ux ml ai llm llms gpt chatgpt claude gemini copilot openai anthropic
+dotnet net csharp java python golang go rust typescript javascript nodejs node react angular vue nextjs php ruby swift kotlin
+hubspot linkedin slack telegram whatsapp zoom teams outlook gmail zoho notion jira confluence trello miro figma
+outstaff outstaffing outsource outsourcing nearshore offshore onboarding offboarding upsell presale presales
+healthcheck health check audit managed migration migrations performance tuning indexing failover alwayson backup backups
+ok okay lol btw asap fyi imho pls plz thx tbh afaik eod eta wfh ooo

@@ -1,0 +1,14 @@
+# Сборка
+.build/
+build/
+*.dmg
+
+# Личное: резервные копии базы слов и старые версии программы
+backup-userdata-*/
+KeySwitch-rollback/
+
+# Отдельная программа, в этот репозиторий не входит
+KeyClean/
+
+# macOS
+.DS_Store
