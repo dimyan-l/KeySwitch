@@ -75,7 +75,12 @@ enum FieldProbe {
         let before: String
         let selected: String
         let after: String
+        /// More text is selected than right ⌥ converts: it was not read, and nothing is done with it.
+        var selectionTooLong = false
     }
+
+    /// Longest selection right ⌥ converts (the engine's limit; larger ones are not even read).
+    static let maxSelection = 1000
 
     /// Self-test only: the stand's field (whole text, caret or selection start, selection length).
     nonisolated(unsafe) static var simulatedField: (() -> (text: String, caret: Int, selection: Int))?
@@ -105,6 +110,7 @@ enum FieldProbe {
               let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
         var sel = CFRange()
         guard AXValueGetValue(ref as! AXValue, .cfRange, &sel), sel.location >= 0 else { return nil }
+        if sel.length > maxSelection * 2 { return Around(before: "", selected: "", after: "", selectionTooLong: true) }
         var total = Int.max
         var countRef: CFTypeRef?
         if AXUIElementCopyAttributeValue(el, kAXNumberOfCharactersAttribute as CFString, &countRef) == .success,

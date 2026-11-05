@@ -98,6 +98,11 @@ final class SwitchEngine {
     private var busy = false
     /// The word in progress was switched mid-word: the layout its first letters were typed in.
     private var early: Lang?
+    /// A short word before it went along with that switch ("z" → "я"): as typed and as retyped, for the undo.
+    private var earlyRetro: (typed: String, result: String)?
+    /// You converted the word in progress with right ⌥: it is learned (or protected) once it is finished,
+    /// not as the half you had typed, and it is not auto-fixed back. `undidEarly`: that ⌥ undid our switch mid-word.
+    private var manualWord: (lang: Lang, undidEarly: Bool)?
     private var pending: [CGEvent] = []
     private var rightOptionDownAt: Date?
     private var rightOptionDirty = false
@@ -201,6 +206,8 @@ final class SwitchEngine {
         watch = nil
         context = nil
         early = nil
+        earlyRetro = nil
+        manualWord = nil
     }
 
     /// Another app came to the front: nothing typed before belongs to it.
@@ -221,6 +228,8 @@ final class SwitchEngine {
             self.prev = nil
             self.context = nil
             self.early = nil
+            self.earlyRetro = nil
+            self.manualWord = nil
         }
     }
 
@@ -308,7 +317,8 @@ final class SwitchEngine {
         case 51: // Delete (backspace)
             if !word.isEmpty {
                 word.removeLast()
-                if word.count < Thresholds.earlyLength { early = nil } // erased back into the switched start: it is yours again
+                if word.count < Thresholds.earlyLength { early = nil; earlyRetro = nil } // erased back into the switched start: it is yours again
+                if word.isEmpty { manualWord = nil }
             } else {
                 prev = nil
                 recent?.edited = true
@@ -357,6 +367,7 @@ final class SwitchEngine {
               !rules.protectsPrefix(cur, lang: curLang) else { return false }
         var deleteCount = word.count - 1 // this key has not reached the field
         var text = alt
+        var retro: (typed: String, result: String)?
         // A short word before it goes along, as at the end of a word ("z ghbd" → "я прив").
         if let p = prev, p.lang == curLang, p.terminator.keyCode == 49, p.strokes.count <= 3 {
             let pc = layouts.string(p.strokes, layout: layout), pa = layouts.string(p.strokes, in: target)
@@ -364,10 +375,12 @@ final class SwitchEngine {
                !rules.blocks(classifier.models[curLang]?.core(normalizeWord(pc)) ?? pc, lang: curLang, kind: .layout) {
                 deleteCount += p.strokes.count + 1
                 text = pa + " " + alt
+                retro = (pc, pa)
             }
         }
         prev = nil
         early = curLang
+        earlyRetro = retro
         perform(Self.retype(delete: deleteCount, typed: nil, with: text))
         select(target)
         return true
@@ -377,13 +390,18 @@ final class SwitchEngine {
     /// (history, toast, right ⌥ undoes it and remembers the word).
     private func finishEarly(strokes: [Stroke], result: String, from: Lang, to: Lang, terminator: Stroke, isKey: Bool) {
         let original = layouts.string(strokes, in: from)
+        // The short word that went along is undone with it: right ⌥ puts back "z ghbdtn", not "я ghbdtn".
+        let retro = earlyRetro
+        earlyRetro = nil
+        let shownTyped = retro.map { $0.typed + " " + original } ?? original
+        let shownResult = retro.map { $0.result + " " + result } ?? result
         let core = classifier?.models[from]?.core(normalizeWord(original)) ?? normalizeWord(original)
         let undoable = Self.isUndoable(terminator)
         bumpStats()
         context = (to, Date())
-        emit(FixEvent(typed: original, result: result, kind: .layout, from: from, to: to, undoable: undoable))
+        emit(FixEvent(typed: shownTyped, result: shownResult, kind: .layout, from: from, to: to, undoable: undoable))
         guard undoable else { last = nil; watch = nil; prev = nil; return }
-        last = Correction(typedText: result, originalText: original, terminator: terminator, terminatorIsKey: isKey,
+        last = Correction(typedText: shownResult, originalText: shownTyped, terminator: terminator, terminatorIsKey: isKey,
                           from: from, to: to, originalWord: core, resultWord: result, kind: .layout)
         watch = Watch(original: core, length: result.count + 1)
         prev = (strokes, terminator, to)
@@ -408,6 +426,8 @@ final class SwitchEngine {
         word = []
         let earlyFrom = early
         early = nil
+        let manual = manualWord
+        manualWord = nil
         let retyped = watch?.erasedAll == true ? watch : nil
         watch = nil
         guard !strokes.isEmpty else {
@@ -433,6 +453,18 @@ final class SwitchEngine {
             }
             r.wordsAfter += 1
             recent = r
+        }
+
+        // Converted by hand with right ⌥ while typing: leave it, and learn the whole word now.
+        if let m = manual, m.lang == curLang {
+            if m.undidEarly {
+                addRule(core, lang: curLang, kind: .layout, result: layouts.string(strokes, in: curLang.other), source: .undo)
+            } else {
+                learnPositive(curStr, lang: curLang)
+            }
+            prev = (strokes, terminator, curLang)
+            last = nil
+            return false
         }
 
         guard settings.autoEnabled, let classifier, layouts.hasBothLayouts else {
@@ -778,9 +810,12 @@ final class SwitchEngine {
         if !word.isEmpty {
             let alt = layouts.string(word, in: target)
             logMiss(typed: layouts.string(word, in: curLang), alt: alt, lang: curLang, how: "⌥ посреди слова")
+            // The word is yours now: learned (or, if this undid our switch mid-word, protected) when it ends.
+            manualWord = (target, early != nil)
+            early = nil
+            earlyRetro = nil
             perform([.backspace(word.count), .text(alt)])
             select(target)
-            _ = learnPositive(alt, lang: target)
             return
         }
         if let p = prev, p.lang == curLang {
@@ -811,7 +846,7 @@ final class SwitchEngine {
 
     // MARK: - Right ⌥ on a word you came back to
 
-    static let maxSelection = 1000
+    static let maxSelection = FieldProbe.maxSelection
     /// The last word converted at the caret: pressing right ⌥ on it again puts it back and forgets what was learned.
     private var caretFix: (result: String, learned: String?, lang: Lang, at: Date)?
 
@@ -870,6 +905,7 @@ final class SwitchEngine {
 
     private func applyAtCaret(_ around: FieldProbe.Around?, fallback: Lang) {
         // Some apps answer with an empty field instead of saying nothing: try the clipboard there too.
+        if around?.selectionTooLong == true { return giveUp(fallback) }
         guard let a = around, !(a.before.isEmpty && a.selected.isEmpty && a.after.isEmpty) || FieldProbe.simulatedField != nil else {
             fixViaClipboard(fallback: fallback)
             return
@@ -891,24 +927,30 @@ final class SwitchEngine {
     /// Where the field tells nothing (some web editors, Electron): ⌘C shows a selection; otherwise ⌥⇧← selects
     /// the word left of the caret and ⌘C reads it. Your clipboard is put back right after.
     private func fixViaClipboard(fallback: Lang) {
-        let pb = NSPasteboard.general
-        let saved = Self.snapshot(pb)
-        let start = pb.changeCount
-        ClipboardHistory.pausedUntil = Date().addingTimeInterval(3)
+        // The pasteboard belongs to the main thread; these hops happen once per right ⌥, while your keys are held.
+        let (saved, start) = Self.onMainSync { (Self.snapshot(NSPasteboard.general), NSPasteboard.general.changeCount) }
+        ClipboardHistory.pausedUntil = Date().addingTimeInterval(4)
         typer.run([.command(8), .pause(0.12)]) { [weak self] ok in
             guard let self else { return }
-            guard ok else { Self.restore(saved, pb, changedFrom: start); return self.giveUp(fallback) }
-            if pb.changeCount != start, let s = pb.string(forType: .string), !s.isEmpty,
-               s.count <= Self.maxSelection, !s.contains(where: \.isNewline) {
-                Self.restore(saved, pb, changedFrom: start)
-                guard let c = self.manualConversion(of: s, fallback: fallback) else { return self.giveUp(fallback) }
+            guard ok else { Self.restore(saved, changedFrom: start); return self.giveUp(fallback) }
+            let (now, copied) = Self.onMainSync { (NSPasteboard.general.changeCount, NSPasteboard.general.string(forType: .string)) }
+            if now != start {
+                // ⌘C copied something: that is a selection, converted whole (several lines too), or left alone.
+                // Text ending in a line break is how some editors copy the current line when nothing is
+                // selected: typing over it would insert a second copy, so nothing is done then.
+                Self.restore(saved, changedFrom: start)
+                guard let s = copied, !s.isEmpty, s.count <= Self.maxSelection, !(s.last?.isNewline ?? false),
+                      let c = self.manualConversion(of: s, fallback: fallback) else { return self.giveUp(fallback) }
                 self.replaceAtCaret([.text(c.text)], original: s, c, how: "выделение")
                 return
             }
-            let mid = pb.changeCount
-            self.typer.run([.key(123, [.maskAlternate, .maskShift]), .command(8), .pause(0.12)]) { ok in
-                let s = pb.changeCount != mid ? pb.string(forType: .string) : nil
-                Self.restore(saved, pb, changedFrom: start)
+            let mid = now
+            // Two ⌘C in quick succession open DeepL and similar apps: leave half a second between them.
+            self.typer.run([.pause(0.5), .key(123, [.maskAlternate, .maskShift]), .command(8), .pause(0.12)]) { ok in
+                let s: String? = Self.onMainSync {
+                    NSPasteboard.general.changeCount != mid ? NSPasteboard.general.string(forType: .string) : nil
+                }
+                Self.restore(saved, changedFrom: start)
                 // Only a word that touches the caret: after a space right ⌥ just switches the layout.
                 guard ok, let s, !s.isEmpty, s.count <= 100, !s.contains(where: \.isWhitespace),
                       let c = self.manualConversion(of: s, fallback: fallback) else {
@@ -928,12 +970,19 @@ final class SwitchEngine {
         }
     }
 
-    private static func restore(_ items: [NSPasteboardItem], _ pb: NSPasteboard, changedFrom start: Int) {
-        if pb.changeCount != start {
-            pb.clearContents()
-            if !items.isEmpty { pb.writeObjects(items) }
+    private static func restore(_ items: [NSPasteboardItem], changedFrom start: Int) {
+        onMainSync {
+            let pb = NSPasteboard.general
+            if pb.changeCount != start {
+                pb.clearContents()
+                if !items.isEmpty { pb.writeObjects(items) }
+            }
+            ClipboardHistory.pausedUntil = Date().addingTimeInterval(0.8)
         }
-        ClipboardHistory.pausedUntil = Date().addingTimeInterval(0.8)
+    }
+
+    private static func onMainSync<T>(_ work: () -> T) -> T {
+        Thread.isMainThread ? work() : DispatchQueue.main.sync(execute: work)
     }
 
     private func replaceAtCaret(_ actions: [Typer.Action], original: String, _ c: (text: String, from: Lang, to: Lang), how: String) {

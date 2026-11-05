@@ -267,6 +267,25 @@ extension SelfTest {
         f.typeKeys("z cltkfkf ")
         check("14. короткое слово перед ним тоже: «я сделала»", f.string == "я сделала ")
 
+        // 15. Audit fixes: undo takes the short word along; right ⌥ mid-word protects the finished word, not its half.
+        f.clear(); f.use(.en)
+        f.typeKeys("z cltkfkf ")
+        f.rightOption()
+        check("15. отмена возвращает и короткое слово: «z cltkfkf »", f.string == "z cltkfkf " && f.lang == .en)
+        f.clear(); f.use(.en)
+        f.typeKeys("ntkt")
+        check("15. «ntkt» переключилось посреди слова → «теле»", f.string == "теле")
+        f.rightOption()
+        check("15. правый ⌥ посреди слова вернул «ntkt»", f.string == "ntkt" && f.lang == .en)
+        f.typeKeys("ajy ")
+        check("15. слово допечатано как есть, без новой замены", f.string == "ntktajy ")
+        check("15. запомнено целое слово, а не «теле»/«ntkt»",
+              store.rules.blocks("ntktajy", lang: .en, kind: .layout) && !store.rules.blocks("ntkt", lang: .en, kind: .layout)
+              && store.learned[.ru]?.contains("теле") != true)
+        f.clear(); f.use(.en)
+        f.typeKeys("ntktajy ")
+        check("15. в следующий раз это слово не переключается", f.string == "ntktajy ")
+
         // 13. Right ⌥ on a word you came back to: the buffer is gone, the field is read instead.
         f.set("привет ghbdtn мир"); f.click(at: 10)
         logged = []

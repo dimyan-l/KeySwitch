@@ -32,10 +32,14 @@ final class Typer {
         get { lock.lock(); defer { lock.unlock() }; return _frontPID }
         set { lock.lock(); _frontPID = newValue; lock.unlock() }
     }
-    nonisolated(unsafe) private var _cancelled = false
+    /// Runs are numbered when they are asked for; `cancel()` stops every run asked for so far, even one
+    /// still waiting in the queue (a click right after a fix must not let it start typing).
+    nonisolated(unsafe) private var _requested = 0
+    nonisolated(unsafe) private var _cancelledThrough = 0
+    nonisolated(unsafe) private var current = 0
     private var cancelled: Bool {
-        get { Self.lock.lock(); defer { Self.lock.unlock() }; return _cancelled }
-        set { Self.lock.lock(); _cancelled = newValue; Self.lock.unlock() }
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        return current <= _cancelledThrough
     }
     /// The app the current run started in: if another app comes to the front, the rest is not typed there.
     nonisolated(unsafe) private var targetPID: pid_t = 0
@@ -47,7 +51,9 @@ final class Typer {
     var sink: ((Action) -> Void)?
 
     /// Stops the current run before its next key (a click elsewhere, focus moved).
-    func cancel() { cancelled = true }
+    func cancel() {
+        Self.lock.lock(); _cancelledThrough = _requested; Self.lock.unlock()
+    }
 
     /// `completion(true)` when every action was posted, `false` when the run stopped early
     /// because focus left the app or `cancel()` was called.
@@ -58,8 +64,9 @@ final class Typer {
             return
         }
         let pid = Self.frontPID
+        Self.lock.lock(); _requested += 1; let number = _requested; Self.lock.unlock()
         queue.async {
-            self.cancelled = false
+            Self.lock.lock(); self.current = number; Self.lock.unlock()
             self.targetPID = pid
             var finished = true
             for a in actions where finished { finished = self.perform(a) }

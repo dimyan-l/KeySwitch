@@ -27,6 +27,9 @@ final class KeyboardLayouts {
     /// The active layout as macOS last reported it (refreshed on every layout-change notification),
     /// so the keyboard thread never has to ask the system.
     private var _current: Source?
+    /// A switch asked for from the keyboard thread that the main thread has not made yet: until it has,
+    /// a refresh triggered by an older notification must not put the previous layout back.
+    private var _pending: Source?
     private var _simulated: Lang?
 
     var preferred: [Lang: Source] { lock.withLock { _preferred } }
@@ -65,7 +68,7 @@ final class KeyboardLayouts {
             }
             // Also remember whatever is active right now.
             if let lang = active.lang, active.layout != nil { _preferred[lang] = active }
-            _current = active
+            _current = _pending ?? active
         }
     }
 
@@ -88,10 +91,15 @@ final class KeyboardLayouts {
             if _simulated != nil { _simulated = lang; return nil }
             guard let src = _preferred[lang] else { return nil }
             _current = src
+            _pending = src
             return src
         }
         guard let src else { return }
-        if Thread.isMainThread { TISSelectInputSource(src.ref) } else { DispatchQueue.main.async { TISSelectInputSource(src.ref) } }
+        let apply = { [weak self] in
+            TISSelectInputSource(src.ref)
+            self?.lock.withLock { if self?._pending?.id == src.id { self?._pending = nil } }
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
 
     // MARK: - Translation

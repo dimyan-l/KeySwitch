@@ -15,10 +15,14 @@ enum SpellCorrector {
     /// Is this a valid word form? The 80 000-word frequency list misses many real forms ("выставь", rare
     /// case endings), so the system's local morphological dictionary vetoes "fixing" them. Candidates still
     /// come only from our own dictionaries. Replaceable in tests; nil = no veto.
+    /// Called from the keyboard thread (and once at launch to warm it up): one call at a time.
+    /// The newer `check(_:range:types:…)` API was tried and accepts typos like «внось»: this one does not.
+    private static let spellLock = NSLock()
     static var isValidForm: ((String, Lang) -> Bool)? = { word, lang in
-        let r = NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0, language: lang.rawValue,
-                                                    wrap: false, inSpellDocumentWithTag: 0, wordCount: nil)
-        return r.location == NSNotFound
+        spellLock.withLock {
+            NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0, language: lang.rawValue,
+                                                wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
+        }
     }
 
     static func correction(for typed: String, altReading: String, model m: LanguageModel, other: LanguageModel?) -> String? {

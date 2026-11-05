@@ -119,7 +119,7 @@ enum CaretLocator {
     static func locate(_ completion: @escaping (NSRect?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let rect = caretRect()
-            DispatchQueue.main.async { completion(rect) }
+            DispatchQueue.main.async { completion(rect.flatMap(toScreen)) }
         }
     }
 
@@ -128,13 +128,13 @@ enum CaretLocator {
         AXUIElementSetMessagingTimeout(system, 0.15)
         var focusedRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
-              let focusedRef else { return nil }
+              let focusedRef, CFGetTypeID(focusedRef) == AXUIElementGetTypeID() else { return nil }
         let element = focusedRef as! AXUIElement
         AXUIElementSetMessagingTimeout(element, 0.15)
 
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let rangeRef else { return nil }
+              let rangeRef, CFGetTypeID(rangeRef) == AXValueGetTypeID() else { return nil }
         var range = CFRange()
         guard AXValueGetValue(rangeRef as! AXValue, .cfRange, &range) else { return nil }
 
@@ -144,11 +144,14 @@ enum CaretLocator {
         var boundsRef: CFTypeRef?
         guard AXUIElementCopyParameterizedAttributeValue(
             element, kAXBoundsForRangeParameterizedAttribute as CFString, probeValue, &boundsRef) == .success,
-              let boundsRef else { return nil }
+              let boundsRef, CFGetTypeID(boundsRef) == AXValueGetTypeID() else { return nil }
         var rect = CGRect.zero
         guard AXValueGetValue(boundsRef as! AXValue, .cgRect, &rect), rect.height > 0, rect.width < 2000 else { return nil }
+        return rect
+    }
 
-        // Accessibility uses a top-left origin on the primary screen; AppKit uses bottom-left.
+    /// Main thread. Accessibility uses a top-left origin on the primary screen; AppKit uses bottom-left.
+    private static func toScreen(_ rect: CGRect) -> NSRect? {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let cocoa = NSRect(x: rect.minX, y: primaryHeight - rect.maxY, width: rect.width, height: rect.height)
         return NSScreen.screens.contains { $0.frame.intersects(cocoa) } ? cocoa : nil
