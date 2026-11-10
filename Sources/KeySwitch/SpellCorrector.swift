@@ -1,78 +1,91 @@
-import AppKit
+import Foundation
 
-/// Cautious typo fixer. It only runs on words the layout classifier decided to leave alone, and only
-/// touches a word when every guard below holds. Candidates come from your own dictionaries (so jargon,
-/// `my_*.txt` and learned words are never "fixed"), ranked by frequency.
+/// A bounded, dictionary-only typo check that is safe to run in the keyboard tap.
+/// It never calls the system spell checker or reads files while handling a key.
 enum SpellCorrector {
     static let minLength = 4
-    /// log10(per-billion frequency): the replacement must be a reasonably common word.
-    static let minScore: Float = 3.0
-    /// The best candidate must beat the runner-up by this much (1.0 = 10x as frequent; 0.5 gave 2.6-4.7% wrong fixes on synthetic typos, 1.5 lost classics like recieve).
+    static let maxLength = 16
+    static let minScore: Float = 3.5
+    static let soloScore: Float = 4.3
     static let margin: Float = 1.0
-    /// A lone candidate has no runner-up to beat, which proves nothing: it must be common on its own.
-    static var soloScore: Float = 3.5
 
-    /// Is this a valid word form? The 80 000-word frequency list misses many real forms ("выставь", rare
-    /// case endings), so the system's local morphological dictionary vetoes "fixing" them. Candidates still
-    /// come only from our own dictionaries. Replaceable in tests; nil = no veto.
-    /// Called from the keyboard thread (and once at launch to warm it up): one call at a time.
-    /// The newer `check(_:range:types:…)` API was tried and accepts typos like «внось»: this one does not.
-    private static let spellLock = NSLock()
-    static var isValidForm: ((String, Lang) -> Bool)? = { word, lang in
-        spellLock.withLock {
-            NSSpellChecker.shared.checkSpelling(of: word, startingAt: 0, language: lang.rawValue,
-                                                wrap: false, inSpellDocumentWithTag: 0, wordCount: nil).location == NSNotFound
-        }
-    }
-
-    static func correction(for typed: String, altReading: String, model m: LanguageModel, other: LanguageModel?) -> String? {
-        // Plain lowercase words only: names, ALLCAPS, CamelCase, digits, hyphens and apostrophes are left alone.
-        guard typed.count >= minLength, typed == typed.lowercased() else { return nil }
-        let w = normalizeWord(typed)
-        guard w.allSatisfy({ m.letters.contains($0) }) else { return nil }
-        // A known word is not a typo.
-        guard m.score(w) == nil else { return nil }
-        // The same keys read in the other layout are a real word: that is a layout question, not a typo.
-        if let o = other {
-            let alt = o.core(normalizeWord(altReading))
-            if o.isWord(alt), o.score(alt) != nil { return nil }
+    static func correction(for typed: String, alternative: String,
+                           model: LanguageModel, other: LanguageModel?) -> String? {
+        guard (minLength...maxLength).contains(typed.count), typed == typed.lowercased() else { return nil }
+        let word = normalizeWord(typed)
+        guard word.allSatisfy({ model.letters.contains($0) }), model.score(word) == nil else { return nil }
+        if let other {
+            let alternate = other.core(normalizeWord(alternative))
+            if other.isWord(alternate), other.score(alternate) != nil { return nil }
         }
 
         var best: (word: String, score: Float)?
         var runnerUp: Float?
-        for c in candidates(w, letters: m.letters) {
-            guard let s = m.score(c), s >= minScore else { continue }
-            if let b = best {
-                if s > b.score { runnerUp = b.score; best = (c, s) } else if s > (runnerUp ?? -.infinity) { runnerUp = s }
+        for candidate in candidates(word, letters: model.letters) {
+            guard let score = model.score(candidate), score >= minScore else { continue }
+            if let current = best {
+                if score > current.score {
+                    runnerUp = current.score
+                    best = (candidate, score)
+                } else if score > (runnerUp ?? -.infinity) {
+                    runnerUp = score
+                }
             } else {
-                best = (c, s)
+                best = (candidate, score)
             }
         }
-        guard let b = best else { return nil }
-        if let r = runnerUp {
-            guard b.score - r >= margin else { return nil }
+        guard let best else { return nil }
+        if let runnerUp {
+            guard best.score - runnerUp >= margin else { return nil }
         } else {
-            guard b.score >= soloScore else { return nil }
+            guard best.score >= soloScore else { return nil }
         }
-        // Checked last: the system dictionary is the slowest step and only needed when we are about to change the word.
-        if let valid = isValidForm, valid(typed, m.lang) { return nil }
-        return b.word
+        return best.word
     }
 
-    /// Every string one edit away: deletion, transposition, substitution, insertion.
-    static func candidates(_ w: String, letters: Set<Character>) -> Set<String> {
-        let chars = Array(w)
+    /// Manual suggestions can be broader than automatic corrections: the user
+    /// chooses one, and this work runs outside the keyboard event tap.
+    static func suggestions(for typed: String, model: LanguageModel, limit: Int = 3) -> [String] {
+        let word = normalizeWord(typed)
+        guard (minLength...maxLength).contains(word.count), model.isWord(word),
+              model.score(word) == nil else { return [] }
+        return candidates(word, letters: model.letters)
+            .compactMap { candidate -> (String, Float)? in
+                guard let score = model.score(candidate), score >= 3.0 else { return nil }
+                return (candidate, score)
+            }
+            .sorted { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 > $1.1 }
+            .prefix(max(0, limit))
+            .map(\.0)
+    }
+
+    private static func candidates(_ word: String, letters: Set<Character>) -> Set<String> {
+        let chars = Array(word)
         let alphabet = Array(letters)
-        var out = Set<String>()
-        for i in 0..<chars.count {
-            var d = chars; d.remove(at: i); out.insert(String(d))
-            if i + 1 < chars.count { var t = chars; t.swapAt(i, i + 1); out.insert(String(t)) }
-            for a in alphabet where a != chars[i] { var r = chars; r[i] = a; out.insert(String(r)) }
+        var result = Set<String>()
+        for i in chars.indices {
+            var deletion = chars
+            deletion.remove(at: i)
+            result.insert(String(deletion))
+            if i + 1 < chars.count {
+                var swap = chars
+                swap.swapAt(i, i + 1)
+                result.insert(String(swap))
+            }
+            for letter in alphabet where letter != chars[i] {
+                var replacement = chars
+                replacement[i] = letter
+                result.insert(String(replacement))
+            }
         }
         for i in 0...chars.count {
-            for a in alphabet { var n = chars; n.insert(a, at: i); out.insert(String(n)) }
+            for letter in alphabet {
+                var insertion = chars
+                insertion.insert(letter, at: i)
+                result.insert(String(insertion))
+            }
         }
-        out.remove(w)
-        return out
+        result.remove(word)
+        return result
     }
 }

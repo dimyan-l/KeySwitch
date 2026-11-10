@@ -1,0 +1,293 @@
+import XCTest
+import CoreGraphics
+@testable import KeySwitch
+
+final class TyperTests: XCTestCase {
+    private func makeStore() -> UserStore {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return UserStore(directory: directory, bundledRulesURL: nil)
+    }
+
+    func testBufferedKeyUpsAndModifierReleasePreserveSemanticUndo() {
+        for releaseCode: UInt16? in [nil, 61, 56] {
+            let queue = DispatchQueue(label: "test.undoAfterRelease")
+            queue.suspend()
+            var posted: [CGEvent] = []
+            let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
+            let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+            let stroke = Stroke(keyCode: 0, shift: false, caps: false)
+            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b", strokes: [stroke],
+                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: 49, keyDown: false)!
+            XCTAssertNil(engine.handle(type: .keyUp, event: up))
+            if let code = releaseCode {
+                let release = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)!
+                release.type = .flagsChanged
+                release.flags = []
+                XCTAssertNil(engine.handle(type: .flagsChanged, event: release))
+            }
+            let drained = expectation(description: "correction and releases replayed")
+            queue.resume()
+            queue.async { DispatchQueue.main.async { drained.fulfill() } }
+            wait(for: [drained], timeout: 2)
+            XCTAssertFalse(engine.isTyping)
+            XCTAssertEqual(posted.suffix(releaseCode == nil ? 1 : 2).map(\.type),
+                           releaseCode == nil ? [.keyUp] : [.keyUp, .flagsChanged])
+
+            // Exercise undo, but cancel before its worker runs: no real source selection
+            // or undo learning, and the injected sink never posts system events.
+            queue.suspend()
+            let postedBeforeUndo = posted.count
+            engine.manualFix()
+            XCTAssertTrue(engine.isTyping, "Releases must preserve the correction's undo branch")
+            engine.cancelPendingTyping()
+            let cancelled = expectation(description: "undo cancelled before worker")
+            queue.resume()
+            queue.async { DispatchQueue.main.async { cancelled.fulfill() } }
+            wait(for: [cancelled], timeout: 2)
+            XCTAssertEqual(posted.count, postedBeforeUndo)
+        }
+    }
+
+    func testBufferedTextNavigationAndCapsLockInvalidateUndo() {
+        for code: UInt16 in [0, 123, 57] {
+            let queue = DispatchQueue(label: "test.staleUndo")
+            queue.suspend()
+            let typer = Typer(queue: queue, eventSink: { _ in })
+            let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b",
+                strokes: [Stroke(keyCode: 0, shift: false, caps: false)],
+                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!
+            if code == 57 { event.type = .flagsChanged; event.flags = .maskAlphaShift }
+            XCTAssertNil(engine.handle(type: event.type, event: event))
+            let drained = expectation(description: "state-changing input replayed")
+            queue.resume()
+            queue.async { DispatchQueue.main.async { drained.fulfill() } }
+            wait(for: [drained], timeout: 2)
+            queue.suspend()
+            engine.manualFix()
+            XCTAssertFalse(engine.isTyping, "Replayed text/navigation/Caps Lock must not leave stale undo")
+            engine.cancelPendingTyping()
+            let cancelled = expectation(description: "no stale undo worker")
+            queue.resume()
+            queue.async { DispatchQueue.main.async { cancelled.fulfill() } }
+            wait(for: [cancelled], timeout: 2)
+        }
+    }
+
+    func testPhysicalKeyDuringRewritePreservesReplacementDelimiterAndInputOrder() {
+        let queue = DispatchQueue(label: "test.rewrite")
+        let reachedDeletion = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        var posted: [CGEvent] = []
+        let typer = Typer(queue: queue, eventSink: { event in
+            posted.append(event.copy()!)
+            if posted.count == 2 {
+                reachedDeletion.signal()
+                _ = resume.wait(timeout: .now() + 2)
+            }
+        })
+        let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+        let done = expectation(description: "rewrite and replay")
+        engine.perform([.backspace(1), .text("x"), .key(49, [])]) {
+            DispatchQueue.main.async { done.fulfill() }
+        }
+        XCTAssertEqual(reachedDeletion.wait(timeout: .now() + 2), .success)
+        let down = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: true)!
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: false)!
+        let release = CGEvent(keyboardEventSource: nil, virtualKey: 61, keyDown: false)!
+        release.type = .flagsChanged
+        release.flags = []
+        XCTAssertNil(engine.handle(type: .flagsChanged, event: release))
+        down.flags = .maskShift
+        down.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
+        XCTAssertNil(engine.handle(type: .keyDown, event: down))
+        XCTAssertNil(engine.handle(type: .keyUp, event: up))
+        // The tap owns a copy, not this mutable callback event.
+        down.flags = []
+        down.setIntegerValueField(.keyboardEventKeycode, value: 13)
+        resume.signal()
+        wait(for: [done], timeout: 3)
+        XCTAssertEqual(posted.map { $0.getIntegerValueField(.keyboardEventKeycode) }, [51, 51, 0, 0, 49, 49, 61, 12, 12])
+        XCTAssertEqual(posted.map(\.type), [.keyDown, .keyUp, .keyDown, .keyUp, .keyDown, .keyUp, .flagsChanged, .keyDown, .keyUp])
+        XCTAssertEqual(posted.last { $0.type == .keyDown }?.flags, .maskShift)
+        XCTAssertEqual(posted.last { $0.type == .keyDown }?.getIntegerValueField(.keyboardEventAutorepeat), 1)
+        XCTAssertTrue(posted.allSatisfy { $0.getIntegerValueField(.eventSourceUserData) == Typer.marker })
+        XCTAssertFalse(engine.isTyping)
+    }
+
+    func testAppChangeBeforeCompletionDropsBufferedInputWithoutNotification() {
+        let queue = DispatchQueue(label: "test.focus")
+        queue.suspend()
+        var posted: [CGEvent] = []
+        var pid: pid_t? = 123
+        let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
+        let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { pid })
+        engine.perform([]) { XCTFail("Must not complete in a different app") }
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: true)!
+        XCTAssertNil(engine.handle(type: .keyDown, event: event))
+        pid = 456
+        let drained = expectation(description: "completion drained")
+        queue.resume()
+        queue.async { DispatchQueue.main.async { drained.fulfill() } }
+        wait(for: [drained], timeout: 2)
+        XCTAssertTrue(posted.isEmpty, "Never replay stale physical input into another app")
+        XCTAssertFalse(engine.isTyping)
+    }
+
+    func testObservedAppChangeStopsWorkerBeforeNextPairButReleasesStartedKey() {
+        for action: Typer.Action in [.backspace(3), .text("abc"), .key(49, []), .command(8)] {
+            let queue = DispatchQueue(label: "test.targetPID")
+            let reachedDown = DispatchSemaphore(value: 0)
+            let resume = DispatchSemaphore(value: 0)
+            var posted: [CGEvent] = []
+            let typer = Typer(queue: queue, eventSink: { event in
+                posted.append(event.copy()!)
+                if posted.count == 1 {
+                    reachedDown.signal()
+                    _ = resume.wait(timeout: .now() + 2)
+                }
+            })
+            let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+            // The main-thread observer updates the cache without cancelling the engine.
+            // Hold the worker inside key-down so the in-flight key-up must still post.
+            engine.perform([action, .key(36, [])]) { XCTFail("App change must not succeed") }
+            XCTAssertEqual(reachedDown.wait(timeout: .now() + 2), .success)
+            let physical = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: true)!
+            XCTAssertNil(engine.handle(type: .keyDown, event: physical))
+            typer.updateFrontmostPID(456)
+            let drained = expectation(description: "worker and failed completion drained")
+            resume.signal()
+            queue.async { DispatchQueue.main.async { drained.fulfill() } }
+            wait(for: [drained], timeout: 2)
+            XCTAssertEqual(posted.map(\.type), [.keyDown, .keyUp], "Finish only the started pair; never replay buffered input")
+            XCTAssertEqual(posted.first?.getIntegerValueField(.keyboardEventKeycode),
+                           posted.last?.getIntegerValueField(.keyboardEventKeycode))
+            XCTAssertFalse(engine.isTyping)
+        }
+    }
+
+    func testUnknownFrontmostProcessPostsNothing() {
+        let typer = Typer(queue: DispatchQueue(label: "test.unknownPID"),
+                          eventSink: { _ in XCTFail("Unknown target must not receive keys") })
+        let direct = expectation(description: "direct run refused")
+        typer.run([.backspace(2), .text("x")]) { finished in
+            XCTAssertFalse(finished)
+            direct.fulfill()
+        }
+        wait(for: [direct], timeout: 2)
+
+        let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { nil })
+        engine.perform([.backspace(2), .text("x")]) { XCTFail("Unknown target must not succeed") }
+        let drained = expectation(description: "engine run drained")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+        XCTAssertFalse(engine.isTyping)
+    }
+
+    func testTargetPIDSnapshotRejectsQueuedRunInDifferentApp() {
+        let queue = DispatchQueue(label: "test.queuedTargetPID")
+        queue.suspend()
+        let typer = Typer(queue: queue, eventSink: { _ in XCTFail("Wrong target posted a key") })
+        typer.updateFrontmostPID(123)
+        let done = expectation(description: "queued target invalidated")
+        typer.run([.text("x")], targetPID: 123) { finished in
+            XCTAssertFalse(finished)
+            done.fulfill()
+        }
+        typer.updateFrontmostPID(456)
+        queue.resume()
+        wait(for: [done], timeout: 2)
+    }
+
+    func testDefaultRunSnapshotsObservedPIDBeforeQueueStarts() {
+        let queue = DispatchQueue(label: "test.defaultTargetPID")
+        queue.suspend()
+        let typer = Typer(queue: queue, eventSink: { _ in XCTFail("Default run lost its target snapshot") })
+        typer.updateFrontmostPID(123)
+        let done = expectation(description: "default target invalidated")
+        typer.run([.key(49, [])]) { finished in
+            XCTAssertFalse(finished)
+            done.fulfill()
+        }
+        typer.updateFrontmostPID(nil)
+        queue.resume()
+        wait(for: [done], timeout: 2)
+    }
+
+    func testCancellationBeforeWorkerRunsPostsNothing() {
+        let queue = DispatchQueue(label: "test.beforeRun")
+        queue.suspend()
+        let typer = Typer(queue: queue, eventSink: { _ in XCTFail("Cancelled run posted an event") })
+        let done = expectation(description: "cancelled before run")
+        typer.run([.backspace(3), .text("replacement"), .key(49, [])]) { finished in
+            XCTAssertFalse(finished)
+            done.fulfill()
+        }
+        typer.cancel()
+        queue.resume()
+        wait(for: [done], timeout: 2)
+    }
+
+    func testContextCancellationAndStopDiscardBufferAndStaleCompletion() {
+        for stop in [false, true] {
+            let queue = DispatchQueue(label: "test.invalidate")
+            queue.suspend()
+            var posted: [CGEvent] = []
+            let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
+            let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+            engine.perform([.backspace(1), .text("x"), .key(49, [])]) { XCTFail("Stale success") }
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: true)!
+            XCTAssertNil(engine.handle(type: .keyDown, event: event))
+            if stop { engine.stop() } else { engine.cancelPendingTyping() }
+            XCTAssertFalse(engine.isTyping)
+            let drained = expectation(description: "cancelled completion drained")
+            queue.resume()
+            queue.async { DispatchQueue.main.async { drained.fulfill() } }
+            wait(for: [drained], timeout: 2)
+            XCTAssertTrue(posted.isEmpty)
+            let next = expectation(description: "new context run")
+            engine.perform([.key(0, [])]) { next.fulfill() }
+            wait(for: [next], timeout: 2)
+            XCTAssertEqual(posted.count, 2, "Old buffer must not leak into a new run")
+        }
+    }
+
+    func testDisabledTapImmediatelyInvalidatesBufferedRewrite() {
+        let queue = DispatchQueue(label: "test.disabled")
+        queue.suspend()
+        let typer = Typer(queue: queue, eventSink: { _ in XCTFail("Disabled tap must not replay") })
+        let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+        engine.perform([.key(49, [])]) { XCTFail("Disabled tap success") }
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 12, keyDown: true)!
+        XCTAssertNil(engine.handle(type: .keyDown, event: event))
+        _ = engine.handle(type: .tapDisabledByTimeout, event: event)
+        XCTAssertFalse(engine.isTyping, "Invalidate synchronously, before the queued completion")
+        let drained = expectation(description: "disabled worker drained")
+        queue.resume()
+        queue.async { DispatchQueue.main.async { drained.fulfill() } }
+        wait(for: [drained], timeout: 2)
+    }
+
+    func testCancellationStopsPendingRunWithoutPostingKeys() {
+        // Pause-only runs post no events; a known target is still required.
+        let typer = Typer(eventSink: { _ in XCTFail("Pause must not post events") })
+        typer.updateFrontmostPID(123)
+        let cancelled = expectation(description: "cancelled")
+        typer.run([.pause(0.3)]) { finished in
+            XCTAssertFalse(finished)
+            cancelled.fulfill()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.03) { typer.cancel() }
+        wait(for: [cancelled], timeout: 2)
+
+        let nextRun = expectation(description: "next run")
+        typer.run([.pause(0.01)]) { finished in
+            XCTAssertTrue(finished)
+            nextRun.fulfill()
+        }
+        wait(for: [nextRun], timeout: 2)
+    }
+}

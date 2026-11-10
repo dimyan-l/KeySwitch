@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "KeySwitch",
-    platforms: [.macOS("27.0")],
+    platforms: [.macOS(.v13)],
     targets: [
         .executableTarget(
             name: "KeySwitch",
@@ -14,6 +14,7 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("ServiceManagement"),
             ]
-        )
+        ),
+        .testTarget(name: "KeySwitchTests", dependencies: ["KeySwitch"], path: "Tests/KeySwitchTests")
     ]
 )

@@ -1,0 +1,131 @@
+[
+  {
+    "deleted": false,
+    "lang": "en",
+    "modified": 0,
+    "source": "migrated",
+    "word": "spbdev"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "en",
+    "modified": 0,
+    "result": "шей",
+    "source": "undo",
+    "word": "itq"
+  },
+  {
+    "deleted": false,
+    "lang": "ru",
+    "modified": 0,
+    "source": "migrated",
+    "word": "ру"
+  },
+  {
+    "deleted": false,
+    "lang": "ru",
+    "modified": 0,
+    "source": "migrated",
+    "word": "шь"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "lp",
+    "source": "undo",
+    "word": "дз"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "pg",
+    "source": "undo",
+    "word": "зп"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "bt",
+    "source": "undo",
+    "word": "ие"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "kgh",
+    "source": "undo",
+    "word": "лпр"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "vn",
+    "source": "restore",
+    "word": "мт"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": "ntktajy",
+    "source": "undo",
+    "word": "телефон"
+  },
+  {
+    "deleted": false,
+    "kind": "layout",
+    "lang": "ru",
+    "modified": 0,
+    "result": ".ne,",
+    "source": "undo",
+    "word": "ютуб"
+  },
+  {
+    "deleted": false,
+    "kind": "spell",
+    "lang": "ru",
+    "modified": 0,
+    "result": "парижа",
+    "source": "undo",
+    "word": "парийа"
+  },
+  {
+    "deleted": false,
+    "kind": "spell",
+    "lang": "ru",
+    "modified": 0,
+    "result": "прост",
+    "source": "undo",
+    "word": "промт"
+  },
+  {
+    "deleted": false,
+    "kind": "spell",
+    "lang": "ru",
+    "modified": 0,
+    "result": "твари",
+    "source": "restore",
+    "word": "тварин"
+  },
+  {
+    "deleted": false,
+    "kind": "spell",
+    "lang": "ru",
+    "modified": 0,
+    "result": "хабспот",
+    "source": "restore",
+    "word": "хабспота"
+  }
+]

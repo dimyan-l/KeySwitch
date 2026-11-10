@@ -1,0 +1,1 @@
+# Personal Spanish words can go in ~/Library/Application Support/KeySwitchES/my_es.txt.

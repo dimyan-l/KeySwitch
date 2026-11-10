@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>es</string>
+    <key>CFBundleExecutable</key><string>KeySwitchES</string>
+    <key>CFBundleIdentifier</key><string>com.levantovsky.keyswitches</string>
+    <key>CFBundleName</key><string>KeySwitchES</string>
+    <key>CFBundleDisplayName</key><string>KeySwitch ES</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.3.4</string>
+    <key>CFBundleVersion</key><string>7</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>Personal tool; word lists CC BY-SA 4.0</string>
+</dict>
+</plist>

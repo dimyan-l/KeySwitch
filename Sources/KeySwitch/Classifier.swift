@@ -16,15 +16,6 @@ enum Thresholds {
     static let minNgramLength = 3
     static let customScore: Float = 6.0     // words from custom_*.txt
     static let learnedScore: Float = 7.5    // words learned from your corrections
-    static let uncertainBand: Float = 0.4   // gaps this close to the margin: too close to call, no typo fix either
-    /// Switching mid-word, after `earlyLength` letters: the typed start begins no word of its language, and the
-    /// other reading begins words with this much frequency mass (log10 of summed per-billion frequency).
-    /// Calibrated on the dictionaries: 0.01–0.02% false switches on rare unseen words, 0.04–0.15% on typos in
-    /// the first letters; 56% (RU) and 79% (EN) of longer wrong-layout words switch before they end.
-    static let earlyLength = 4
-    static let earlyMass: Float = 5.0
-    /// The previous word was in the language you are typing in now: ask for more before switching away from it.
-    static let earlyMassSameContext: Float = 5.5
 }
 
 func normalizeWord(_ s: String) -> String {
@@ -38,8 +29,6 @@ final class LanguageModel {
     let wordChars: Set<Character>
     private(set) var words: [String: Float] = [:]
     private var tri: [String: Float] = [:]
-    /// First `Thresholds.earlyLength` letters → summed frequency of the words starting with them (linear units).
-    private(set) var prefixMass: [String: Float] = [:]
     private var ctx: [String: Float] = [:]
     private let vocabSize: Float
 
@@ -83,14 +72,7 @@ final class LanguageModel {
     func add(_ raw: String, score: Float) {
         let w = normalizeWord(raw)
         guard isWord(w) else { return }
-        let had = words[w]
-        words[w] = max(had ?? 0, score)
-        if had == nil { addPrefix(w, score: score) } // later additions (learned words) also count as word starts
-    }
-
-    private func addPrefix(_ w: String, score: Float) {
-        guard w.count >= Thresholds.earlyLength else { return }
-        prefixMass[String(w.prefix(Thresholds.earlyLength)), default: 0] += powf(10, score)
+        words[w] = max(words[w] ?? 0, score)
     }
 
     func trainNgrams() {
@@ -105,8 +87,6 @@ final class LanguageModel {
         }
         self.tri = tri
         self.ctx = ctx
-        prefixMass = [:]
-        for (w, s) in words { addPrefix(w, score: s) }
     }
 
     func ngramScore(_ w: String) -> Float {
@@ -140,8 +120,13 @@ final class LanguageModel {
 struct Decision {
     let convert: Bool
     let reason: String
-    /// Neither reading is known and the call was close: no typo fix is attempted on such a word.
-    let uncertain: Bool
+}
+
+struct CorrectionPlan {
+    let currentWord: String
+    let alternativeWord: String
+    let suffix: String
+    let decision: Decision
 }
 
 final class Classifier {
@@ -173,15 +158,15 @@ final class Classifier {
     /// `current`: the word as the active layout produced it. `alternative`: same keys in the other layout.
     func decide(current: String, alternative: String, currentLang: Lang, contextLang: Lang? = nil) -> Decision {
         guard let cur = models[currentLang], let oth = models[currentLang.other] else {
-            return Decision(convert: false, reason: "no-model", uncertain: false)
+            return Decision(convert: false, reason: "no-model")
         }
         let wc = cur.core(normalizeWord(current))
         let wo = oth.core(normalizeWord(alternative))
         // Pure punctuation ("...", ",") or tokens like URLs: never touch.
         guard !wc.isEmpty || current.contains(where: { $0.isLetter }) else {
-            return Decision(convert: false, reason: "no-letters", uncertain: false)
+            return Decision(convert: false, reason: "no-letters")
         }
-        guard oth.isWord(wo) else { return Decision(convert: false, reason: "other-not-alpha", uncertain: false) }
+        guard oth.isWord(wo) else { return Decision(convert: false, reason: "other-not-alpha") }
 
         var freqMargin = Thresholds.freqMargin
         var ngramMargin = Thresholds.ngramMargin
@@ -193,40 +178,58 @@ final class Classifier {
 
         switch (sc, so) {
         case (.some, .none):
-            return Decision(convert: false, reason: "cur-dict", uncertain: false)
+            return Decision(convert: false, reason: "cur-dict")
         case (.none, .some):
             if wo.count == 1 && contextLang != oth.lang {
-                return Decision(convert: false, reason: "single-letter", uncertain: false)
+                return Decision(convert: false, reason: "single-letter")
             }
-            return Decision(convert: true, reason: "other-dict", uncertain: false)
+            return Decision(convert: true, reason: "other-dict")
         case let (.some(c), .some(o)):
-            return Decision(convert: o - c >= freqMargin, reason: o - c >= freqMargin ? "freq" : "both-dict", uncertain: false)
+            return Decision(convert: o - c >= freqMargin, reason: o - c >= freqMargin ? "freq" : "both-dict")
         case (.none, .none):
             guard wo.count >= Thresholds.minNgramLength else {
-                return Decision(convert: false, reason: "short", uncertain: false)
+                return Decision(convert: false, reason: "short")
             }
             let ngo = oth.ngramScore(wo)
             let ngc: Float = curOK ? cur.ngramScore(wc) : -9
             let gap = ngo - ngc
-            let close = abs(gap - ngramMargin) < Thresholds.uncertainBand
             if ngo > Thresholds.ngramFloor && gap >= ngramMargin {
-                return Decision(convert: true, reason: "ngram", uncertain: close)
+                return Decision(convert: true, reason: "ngram")
             }
-            return Decision(convert: false, reason: "ngram-no", uncertain: close && curOK)
+            return Decision(convert: false, reason: "ngram-no")
         }
     }
 
-    /// Mid-word: the first letters typed in the current layout begin no known word, and in the other layout
-    /// they begin common words. Then the layout is switched right away and the rest of the word comes out right.
-    func shouldSwitchEarly(current: String, alternative: String, currentLang: Lang, contextLang: Lang?) -> Bool {
-        guard let cur = models[currentLang], let oth = models[currentLang.other] else { return false }
-        let pc = normalizeWord(current), po = normalizeWord(alternative)
-        guard pc.count == Thresholds.earlyLength, po.count == Thresholds.earlyLength,
-              po.allSatisfy({ oth.letters.contains($0) }) else { return false }
-        if cur.prefixMass[pc] != nil { return false }
-        guard let mass = oth.prefixMass[po] else { return false }
-        let need = contextLang == currentLang ? Thresholds.earlyMassSameContext : Thresholds.earlyMass
-        return log10f(mass) >= need
+    /// A punctuation key can be a letter in the other layout ('.' -> 'ю').
+    /// At a word boundary, keep a trailing punctuation run when the preceding
+    /// reading is a known correction and the full alternative is not a word.
+    func plan(current: String, alternative: String, currentLang: Lang) -> CorrectionPlan {
+        let full = decide(current: current, alternative: alternative, currentLang: currentLang)
+        let currentChars = Array(current)
+        let alternativeChars = Array(alternative)
+        guard currentChars.count == alternativeChars.count else {
+            return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
+        }
+        var split = currentChars.count
+        while split > 0 {
+            let ch = currentChars[split - 1]
+            let alt = alternativeChars[split - 1]
+            guard !ch.isLetter, !ch.isNumber, !ch.isWhitespace,
+                  ch != "-", ch != "'", alt.isLetter else { break }
+            split -= 1
+        }
+        guard split > 0, split < currentChars.count else {
+            return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
+        }
+        let prefix = String(currentChars[..<split])
+        let altPrefix = String(alternativeChars[..<split])
+        let prefixDecision = decide(current: prefix, alternative: altPrefix, currentLang: currentLang)
+        let fullAlt = models[currentLang.other]?.core(normalizeWord(alternative)) ?? ""
+        if prefixDecision.convert && models[currentLang.other]?.score(fullAlt) == nil {
+            return CorrectionPlan(currentWord: prefix, alternativeWord: altPrefix,
+                                  suffix: String(currentChars[split...]), decision: prefixDecision)
+        }
+        return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
     }
 
     /// A short previous word ("z" before "ghbdtn") is converted together with the next one

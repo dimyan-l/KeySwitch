@@ -1,9 +1,9 @@
-import CoreGraphics
 import Foundation
+import CoreFoundation
 
 final class Settings {
     static let shared = Settings()
-    private let d = UserDefaults.standard
+    private let d: UserDefaults
 
     static let defaultExcluded = [
         "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "com.mitchellh.ghostty",
@@ -11,320 +11,190 @@ final class Settings {
         "com.1password.1password", "com.agilebits.onepassword7", "com.apple.keychainaccess",
     ]
 
-    /// Self-test only: typing scenarios run with fixes on and no app exclusions, whatever you chose.
-    var testMode = false
-
-    private init() {
-        // Updating from 0.1.0, where typo fixes and the copy history were always on: keep what you had.
-        // New installs start with layout fixes only and no copy history.
-        let existing = !(d.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "")?.isEmpty ?? true)
-        if existing {
-            if d.object(forKey: "spellEnabled") == nil { d.set(true, forKey: "spellEnabled") }
-            if d.object(forKey: "clipboardEnabled") == nil { d.set(true, forKey: "clipboardEnabled") }
-        }
+    init(defaults: UserDefaults = .standard) {
+        d = defaults
         d.register(defaults: [
             "autoEnabled": true,
-            "soundEnabled": false,
-            "soundChoice": SwitchSound.drop.rawValue,
-            "soundVolume": 0.4,
-            "excluded": Settings.defaultExcluded,
-            "layoutOnly": [String](),
-            "showToast": true,
-            "earlySwitch": true,
-            "compatibleTyping": false,
-            "missLogEnabled": false,
-            "perAppLayout": true,
-            "iCloudSync": false,
+            "cautiousMode": true,
             "spellEnabled": false,
             "clipboardEnabled": false,
-            "menuBarStyle": "lang",
-            "onboardingDone": false,
+            "selectionSuggestionsEnabled": true,
+            "sound": false,
+            "clipboardSize": 30,
+            "excluded": Settings.defaultExcluded,
         ])
     }
 
-    var spellEnabled: Bool {
-        get { testMode || d.bool(forKey: "spellEnabled") }
-        set { d.set(newValue, forKey: "spellEnabled") }
-    }
-
-    /// The last few copied texts in the panel. Kept in memory only.
-    /// Snapshots only: shows or hides the copies without touching your setting.
-    var clipboardOverride: Bool?
-    var clipboardEnabled: Bool {
-        get { clipboardOverride ?? d.bool(forKey: "clipboardEnabled") }
-        set { d.set(newValue, forKey: "clipboardEnabled") }
-    }
-
-    /// Apps where only the layout is fixed, never typos.
-    var layoutOnly: [String] {
-        get { d.stringArray(forKey: "layoutOnly") ?? [] }
-        set { d.set(newValue, forKey: "layoutOnly") }
-    }
-
-    enum AppMode: String, CaseIterable, Identifiable {
-        case layoutOnly, all, off
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .layoutOnly: "Только раскладка"
-            case .all: "Раскладка и опечатки"
-            case .off: "Не исправлять"
-            }
-        }
-    }
-
-    /// Always off, whatever the lists say: our own windows and JetBrains IDEs.
-    func isAlwaysExcluded(_ bundleID: String) -> Bool {
-        bundleID == Bundle.main.bundleIdentifier || bundleID.hasPrefix("com.jetbrains.")
-    }
-
-    func mode(for bundleID: String) -> AppMode {
-        if isAlwaysExcluded(bundleID) || excluded.contains(bundleID) { return .off }
-        return layoutOnly.contains(bundleID) ? .layoutOnly : .all
-    }
-
-    func setMode(_ m: AppMode, for bundleID: String) {
-        var e = excluded.filter { $0 != bundleID }
-        var l = layoutOnly.filter { $0 != bundleID }
-        switch m {
-        case .off: e.append(bundleID)
-        case .layoutOnly: l.append(bundleID)
-        case .all: break
-        }
-        excluded = e
-        layoutOnly = l
-    }
-
-    /// Apps with their own setting, in the order they were added.
-    var configuredApps: [String] { excluded + layoutOnly.filter { !excluded.contains($0) } }
-
-    /// Typo fixes on for this app.
-    func spellAllowed(in bundleID: String?) -> Bool {
-        guard spellEnabled else { return false }
-        guard let b = bundleID else { return true }
-        return !layoutOnly.contains(b)
-    }
-
-    /// Keep the personal dictionary in iCloud Drive, shared by all your Macs.
-    var iCloudSync: Bool {
-        get { d.bool(forKey: "iCloudSync") }
-        set { d.set(newValue, forKey: "iCloudSync") }
-    }
-    /// Switch to the layout you last used in an app when you come back to it.
-    var perAppLayout: Bool {
-        get { d.bool(forKey: "perAppLayout") }
-        set { d.set(newValue, forKey: "perAppLayout") }
-    }
-    func rememberedLayout(for bundleID: String) -> Lang? {
-        (d.dictionary(forKey: "appLayouts")?[bundleID] as? String).flatMap(Lang.init(rawValue:))
-    }
-    func rememberLayout(_ lang: Lang, for bundleID: String) {
-        var all = d.dictionary(forKey: "appLayouts") ?? [:]
-        guard all[bundleID] as? String != lang.rawValue else { return }
-        all[bundleID] = lang.rawValue
-        d.set(all, forKey: "appLayouts")
-    }
-
-    /// Switch the layout after the first letters when the start of the word already tells.
-    var earlySwitch: Bool {
-        get { testMode || d.bool(forKey: "earlySwitch") }
-        set { d.set(newValue, forKey: "earlySwitch") }
-    }
-    /// Type corrections one character at a time, with pauses: for the rare app that drops fast input.
-    var compatibleTyping: Bool {
-        get { d.bool(forKey: "compatibleTyping") }
-        set { d.set(newValue, forKey: "compatibleTyping") }
-    }
-
-    var showToast: Bool {
-        get { d.bool(forKey: "showToast") }
-        set { d.set(newValue, forKey: "showToast") }
-    }
-    /// "Журнал пропусков": words you fixed or took back yourself, with the reason (see MissLog).
-    var missLogEnabled: Bool {
-        get { d.bool(forKey: "missLogEnabled") }
-        set { d.set(newValue, forKey: "missLogEnabled") }
-    }
-    /// "lang" (RU / EN pill), "dot" or "hidden"
-    var menuBarStyle: String {
-        get { d.string(forKey: "menuBarStyle") ?? "lang" }
-        set { d.set(newValue, forKey: "menuBarStyle") }
-    }
-    var onboardingDone: Bool {
-        get { d.bool(forKey: "onboardingDone") }
-        set { d.set(newValue, forKey: "onboardingDone") }
-    }
-
     var autoEnabled: Bool {
-        get { testMode || d.bool(forKey: "autoEnabled") }
+        get { d.bool(forKey: "autoEnabled") }
         set { d.set(newValue, forKey: "autoEnabled") }
     }
-    var soundEnabled: Bool {
-        get { d.bool(forKey: "soundEnabled") }
-        set { d.set(newValue, forKey: "soundEnabled") }
+    var cautiousMode: Bool {
+        get { d.bool(forKey: "cautiousMode") }
+        set { d.set(newValue, forKey: "cautiousMode") }
     }
-    var soundChoice: String {
-        get { d.string(forKey: "soundChoice") ?? SwitchSound.drop.rawValue }
-        set { d.set(newValue, forKey: "soundChoice") }
+    var spellEnabled: Bool {
+        get { d.bool(forKey: "spellEnabled") }
+        set { d.set(newValue, forKey: "spellEnabled") }
     }
-    var soundVolume: Double {
-        get { d.double(forKey: "soundVolume") }
-        set { d.set(newValue, forKey: "soundVolume") }
+    var clipboardEnabled: Bool {
+        get { d.bool(forKey: "clipboardEnabled") }
+        set { d.set(newValue, forKey: "clipboardEnabled") }
     }
+    var selectionSuggestionsEnabled: Bool {
+        get { d.bool(forKey: "selectionSuggestionsEnabled") }
+        set { d.set(newValue, forKey: "selectionSuggestionsEnabled") }
+    }
+    var sound: Bool {
+        get { d.bool(forKey: "sound") }
+        set { d.set(newValue, forKey: "sound") }
+    }
+    var clipboardSize: Int { max(5, d.integer(forKey: "clipboardSize")) }
 
     var excluded: [String] {
         get { d.stringArray(forKey: "excluded") ?? [] }
         set { d.set(newValue, forKey: "excluded") }
     }
     func isExcluded(_ bundleID: String?) -> Bool {
-        guard let b = bundleID, !testMode else { return false }
-        return isAlwaysExcluded(b) || excluded.contains(b) // our own dialogs (API key field!), JetBrains
+        guard let b = bundleID else { return false }
+        if b == Bundle.main.bundleIdentifier { return true }
+        return excluded.contains(b) || b.hasPrefix("com.jetbrains.")
     }
     func toggleExcluded(_ bundleID: String) {
         var e = excluded
         if let i = e.firstIndex(of: bundleID) { e.remove(at: i) } else { e.append(bundleID) }
         excluded = e
     }
+
 }
 
-/// Persistent learning: your "do not correct" rules and the words you taught it.
-/// Lives in Application Support, or in iCloud Drive when sync is on, so all your Macs share one dictionary.
-/// Every change applies in memory at once; disk writes go through one serial queue, off the keyboard handler.
+/// Persistent learned words and per-language exceptions for automatic changes.
 final class UserStore {
-    // Older learned.json files may also hold "uncertain" / "fixes" lists from an earlier version: they are ignored.
-    // Versions without rules ignore the "rules" key, so the file stays readable after a rollback.
-    fileprivate struct Payload: Codable {
+    private struct Payload: Codable {
         var learned: [String: [String]] = [:]
-        var rules: [UserRule]?
-        /// Learned words were copied into rules once: deleting such a rule must not recreate it.
-        var rulesMigrated: Bool?
+        var pinned: [String] = []
+        var rules: [UserRule] = []
+        var rulesSeededFrom032 = false
+
+        private enum CodingKeys: String, CodingKey { case learned, pinned, rules, rulesSeededFrom032 }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            learned = try values.decodeIfPresent([String: [String]].self, forKey: .learned) ?? [:]
+            pinned = try values.decodeIfPresent([String].self, forKey: .pinned) ?? []
+            rules = try values.decodeIfPresent([UserRule].self, forKey: .rules) ?? []
+            rulesSeededFrom032 = try values.decodeIfPresent(Bool.self, forKey: .rulesSeededFrom032) ?? false
+        }
     }
 
-    static let localDirectory: URL = {
+    static let directory: URL = defaultDirectory()
+
+    private static func defaultDirectory(create: Bool = true) -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = base.appendingPathComponent("KeySwitch", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if create { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         return dir
-    }()
-
-    /// ~/Library/Mobile Documents/com~apple~CloudDocs/KeySwitch, or nil when iCloud Drive is off on this Mac.
-    static var cloudDirectory: URL? {
-        let drive = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: drive.path) else { return nil }
-        return drive.appendingPathComponent("KeySwitch", isDirectory: true)
-    }
-
-    static var directory: URL {
-        if Settings.shared.iCloudSync, let cloud = cloudDirectory {
-            try? FileManager.default.createDirectory(at: cloud, withIntermediateDirectories: true)
-            return cloud
-        }
-        return localDirectory
     }
 
     private static let ioQueue = DispatchQueue(label: "keyswitch.store")
-    /// Fixed folder for tests; nil = the local or iCloud folder from Settings.
-    private let fixedDirectory: URL?
-    var folder: URL { fixedDirectory ?? UserStore.directory }
-    private var url: URL { folder.appendingPathComponent("learned.json") }
+    private let directory: URL
+    private let bundledRulesURL: URL?
+    private let url: URL
+    // Preserve extensions from upstream/future versions, including unsupported languages.
+    private var originalPayload: [String: Any] = [:]
     private var payload = Payload()
+
+    private func readPayload(_ data: Data) throws -> Payload {
+        guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        originalPayload = object
+        if let format = object["localFormat"] {
+            guard format as? String == "referenceDate-v1" else {
+                throw CocoaError(.fileReadUnknownStringEncoding)
+            }
+        } else if object["rulesMigrated"] as? Bool == true,
+                  var records = object["rules"] as? [[String: Any]] {
+            // Older local imports can retain the upstream marker while already containing
+            // reference dates. Classify each number, never blindly shift the entire file.
+            let latest = Date().addingTimeInterval(86_400)
+            for index in records.indices {
+                guard let number = records[index]["modified"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                let value = number.doubleValue
+                if value == 0, records[index]["source"] as? String == "migrated" {
+                    records[index]["modified"] = Date(timeIntervalSince1970: 0).timeIntervalSinceReferenceDate
+                } else if value >= 0, value <= latest.timeIntervalSinceReferenceDate {
+                    // Legacy local date, including a previously imported upstream file.
+                } else if value >= Date.timeIntervalBetween1970AndReferenceDate,
+                          value <= latest.timeIntervalSince1970 {
+                    records[index]["modified"] = Date(timeIntervalSince1970: value).timeIntervalSinceReferenceDate
+                } else {
+                    // Ambiguous historical/future timestamps must not be rewritten by guessing.
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+            }
+            object["rules"] = records
+        }
+        return try JSONDecoder().decode(Payload.self, from: JSONSerialization.data(withJSONObject: object))
+    }
     private(set) var rules = RuleBook()
-    /// Forgotten one by one this session: a merge with another Mac's copy must not bring them back.
-    private var forgotten: [String: Set<String>] = [:]
-    private var seenModification: Date?
-    /// Set when the last write failed: the rules still work in memory, but only until you quit.
     private(set) var saveError: String?
-    /// Test hook: makes every write fail.
-    var simulateWriteFailure = false
+    private var canSave = true
 
-    init(directory: URL? = nil) {
-        fixedDirectory = directory
-        reload()
-    }
-
-    /// Reads learned.json (and my_*.txt on next use) again: after switching sync on/off or when another Mac changed them.
-    /// Waits for queued writes first; changes that could not be written are kept and merged in.
-    func reload() {
-        flush()
-        var disk = Self.read(url) ?? Payload()
-        var book = RuleBook(disk.rules ?? [])
-        if saveError != nil {
-            book = book.merged(with: rules)
-            for (lang, words) in payload.learned {
-                var list = disk.learned[lang] ?? []
-                for w in words where !list.contains(w) { list.append(w) }
-                disk.learned[lang] = list
+    init(directory: URL? = nil,
+         bundledRulesURL: URL? = Bundle.main.resourceURL?.appendingPathComponent("DefaultRules.json"),
+         defaults: UserDefaults = .standard) {
+        let cloudBlocked = directory == nil && defaults.bool(forKey: "iCloudSync")
+        self.directory = directory ?? Self.defaultDirectory(create: !cloudBlocked)
+        self.bundledRulesURL = bundledRulesURL
+        url = self.directory.appendingPathComponent("learned.json")
+        if cloudBlocked {
+            canSave = false
+            saveError = "iCloudSync is enabled, but this build cannot safely sync learned.json. Use the upstream app to disable sync after backing up both local and iCloud KeySwitch folders, then relaunch. No local or cloud files were changed."
+            return
+        }
+        if FileManager.default.fileExists(atPath: url.path) {
+            do { payload = try readPayload(Data(contentsOf: url)) }
+            catch {
+                canSave = false
+                saveError = "Не удалось прочитать learned.json: \(error.localizedDescription)"
             }
         }
-        payload = disk
-        rules = book
-        customCache = [:]
-        seenModification = modificationDate
+        rules = RuleBook(payload.rules)
+        seedBundledRules()
         seedCustomLists()
-        migrateLearnedToRules()
-    }
-
-    /// Blocks until every queued write is on disk (or failed). Never called from the keyboard handler.
-    func flush() { UserStore.ioQueue.sync {} }
-
-    /// Words learned by earlier versions meant "do not correct this": they become visible, removable rules.
-    private func migrateLearnedToRules() {
-        guard payload.rulesMigrated != true else { return }
-        let old = Date(timeIntervalSince1970: 0) // older than any deletion, on any Mac
-        for (l, words) in learned {
-            for w in words where !rules.blocks(w, lang: l, kind: .layout) {
-                var r = UserRule(word: w, lang: l, kind: nil, result: nil, source: .migrated, modified: old)
-                r.deleted = false
-                rules.merge(r)
-            }
-        }
-        payload.rulesMigrated = true
-        save()
-    }
-
-    // MARK: Rules
-
-    /// Applies at once in memory; `done(true)` on the main thread once it is on disk.
-    @discardableResult
-    func addRule(_ word: String, lang: Lang, kind: FixKind?, result: String?, source: RuleSource,
-                 done: ((Bool) -> Void)? = nil) -> UserRule {
-        let r = rules.add(word, lang: lang, kind: kind, result: result, source: source)
-        save(done)
-        return r
-    }
-
-    /// Deleting a rule brings the standard behaviour back: the word is also forgotten as a learned word.
-    func removeRule(_ id: String) {
-        guard let r = rules.byKey[id] else { return }
-        rules.remove(id)
-        if learned[r.lang]?.contains(r.word) == true {
-            payload.learned[r.lang.rawValue]?.removeAll { $0 == r.word }
-            forgotten[r.lang.rawValue, default: []].insert(r.word)
-        }
-        save()
-    }
-
-    /// Writes again after a failure.
-    func retrySave(_ done: ((Bool) -> Void)? = nil) { save(done) }
-
-    /// True when the files changed on disk behind our back (edited by hand, or iCloud brought another Mac's words).
-    var changedOnDisk: Bool { modificationDate != seenModification }
-
-    private var modificationDate: Date? {
-        let files = [url] + Lang.allCases.map(customFile)
-        return files.compactMap { (try? FileManager.default.attributesOfItem(atPath: $0.path))?[.modificationDate] as? Date }.max()
-    }
-
-    private static func read(_ url: URL) -> Payload? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? decoder().decode(Payload.self, from: data)
     }
 
     var learned: [Lang: [String]] {
         var r: [Lang: [String]] = [:]
         for l in Lang.allCases { r[l] = payload.learned[l.rawValue] ?? [] }
         return r
+    }
+    var pinned: [String] {
+        get { payload.pinned }
+        set { payload.pinned = newValue; save() }
+    }
+
+    @discardableResult
+    func addRule(_ word: String, lang: Lang, kind: FixKind?, result: String? = nil,
+                 source: RuleSource = .manual) -> UserRule? {
+        let normalized = normalizeWord(word.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !normalized.isEmpty, normalized.count <= 64,
+              !normalized.contains(where: { $0.isWhitespace }) else { return nil }
+        let rule = rules.add(normalized, lang: lang, kind: kind, result: result, source: source)
+        save()
+        return rule
+    }
+
+    func removeRule(_ id: String) {
+        guard rules.byKey[id] != nil else { return }
+        rules.remove(id)
+        save()
     }
 
     func learn(_ word: String, lang: Lang) {
@@ -333,174 +203,73 @@ final class UserStore {
         var list = payload.learned[lang.rawValue] ?? []
         if !list.contains(w) { list.append(w) }
         payload.learned[lang.rawValue] = list
-        forgotten[lang.rawValue]?.remove(w)
         save()
     }
 
     func forget(_ word: String, lang: Lang) {
-        let w = normalizeWord(word)
-        payload.learned[lang.rawValue]?.removeAll { $0 == w }
-        forgotten[lang.rawValue, default: []].insert(w)
+        payload.learned[lang.rawValue]?.removeAll { $0 == normalizeWord(word) }
         save()
     }
 
     func forgetAllLearned() {
         payload.learned = [:]
-        save(merging: false)
+        save()
     }
 
-    private static func encoder() -> JSONEncoder {
-        let e = JSONEncoder()
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        e.dateEncodingStrategy = .secondsSince1970
-        return e
-    }
-
-    private static func decoder() -> JSONDecoder {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .secondsSince1970
-        return d
-    }
-
-    /// Merges with what is on disk first, so words and rules from another Mac meanwhile are not overwritten.
-    /// Runs on the serial queue (never blocks typing); `done` reports on the main thread whether it reached the disk.
-    private func save(merging: Bool = true, _ done: ((Bool) -> Void)? = nil) {
+    private func save() {
+        guard canSave else { return }
+        payload.rules = rules.all
+        let data: Data
+        do {
+            let known = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as! [String: Any]
+            var object = originalPayload
+            object.merge(known) { _, current in current }
+            object["localFormat"] = "referenceDate-v1"
+            data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        } catch {
+            saveError = "Не удалось подготовить learned.json"
+            return
+        }
         let url = self.url
-        var mine = payload
-        mine.rules = rules.all
-        let forgotten = self.forgotten
-        let fail = simulateWriteFailure
-        UserStore.ioQueue.async {
-            var out = mine
-            if merging, let disk = UserStore.read(url) {
-                out = UserStore.merged(out, disk, forgotten: forgotten)
-            }
-            var error: String?
+        // Called from the keyboard tap: never block typing on disk I/O.
+        UserStore.ioQueue.async { [weak self] in
             do {
-                if fail { throw CocoaError(.fileWriteNoPermission) }
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try UserStore.encoder().encode(out).write(to: url, options: .atomic)
-            } catch let e {
-                error = e.localizedDescription
-            }
-            DispatchQueue.main.async {
-                self.saveError = error
-                if error == nil { self.seenModification = self.modificationDate }
-                done?(error == nil)
+                try data.write(to: url, options: .atomic)
+                DispatchQueue.main.async { self?.saveError = nil }
+            } catch {
+                let message = "Не удалось сохранить learned.json: \(error.localizedDescription)"
+                DispatchQueue.main.async { self?.saveError = message }
             }
         }
     }
 
-    /// `a` wins for learned-word deletions (`forgotten`); rules: the newest change of each wins.
-    private static func merged(_ a: Payload, _ b: Payload, forgotten: [String: Set<String>] = [:]) -> Payload {
-        var out = a
-        for (lang, words) in b.learned {
-            let gone = forgotten[lang] ?? []
-            var list = out.learned[lang] ?? []
-            for w in words where !list.contains(w) && !gone.contains(w) { list.append(w) }
-            out.learned[lang] = list
-        }
-        out.rules = RuleBook(a.rules ?? []).merged(with: RuleBook(b.rules ?? [])).all
-        out.rulesMigrated = (a.rulesMigrated ?? false) || (b.rulesMigrated ?? false) ? true : nil
-        return out
-    }
+    func flushPendingWrites() { UserStore.ioQueue.sync {} }
 
-    /// Switches iCloud sync on or off: waits for pending writes, takes your words and rules along
-    /// (merging with what is already there), then reads the new folder.
-    func setCloudSync(_ on: Bool, cloud: URL) {
-        flush()
-        UserStore.ioQueue.sync {
-            if on { UserStore.merge(from: UserStore.localDirectory, into: cloud) }
-            else { UserStore.merge(from: cloud, into: UserStore.localDirectory) }
-        }
-        Settings.shared.iCloudSync = on
-        reload()
-    }
-
-    /// Copies (merges) everything from one folder into another: used when sync is switched on or off.
-    static func merge(from src: URL, into dst: URL) {
-        let fm = FileManager.default
-        try? fm.createDirectory(at: dst, withIntermediateDirectories: true)
-        var out = read(dst.appendingPathComponent("learned.json")) ?? Payload()
-        if let a = read(src.appendingPathComponent("learned.json")) { out = merged(out, a) }
-        if let data = try? encoder().encode(out) { try? data.write(to: dst.appendingPathComponent("learned.json"), options: .atomic) }
-        for l in Lang.allCases {
-            let name = "my_\(l.rawValue).txt"
-            let from = (try? String(contentsOf: src.appendingPathComponent(name), encoding: .utf8)) ?? ""
-            let to = (try? String(contentsOf: dst.appendingPathComponent(name), encoding: .utf8)) ?? ""
-            let have = Set(to.split(whereSeparator: \.isNewline).filter { !$0.hasPrefix("#") }.flatMap { tokens(of: $0) })
-            let missing = from.split(whereSeparator: \.isNewline).filter { !$0.hasPrefix("#") }
-                .flatMap { tokens(of: $0) }.filter { !have.contains($0) }
-            if to.isEmpty, !from.isEmpty {
-                try? from.write(to: dst.appendingPathComponent(name), atomically: true, encoding: .utf8)
-            } else if !missing.isEmpty {
-                let text = to + (to.hasSuffix("\n") ? "" : "\n") + missing.joined(separator: "\n") + "\n"
-                try? text.write(to: dst.appendingPathComponent(name), atomically: true, encoding: .utf8)
-            }
+    /// Apply 0.3.2 defaults once. Tombstones in a user's file win over older bundled rules.
+    private func seedBundledRules() {
+        guard canSave, !payload.rulesSeededFrom032,
+              let url = bundledRulesURL,
+              FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            let bundled = try JSONDecoder().decode([UserRule].self, from: Data(contentsOf: url))
+            // Defaults fill gaps only; an explicit user choice (including a
+            // deletion) must win regardless of imported timestamps.
+            for rule in bundled where rules.byKey[rule.id] == nil { rules.merge(rule) }
+            payload.rulesSeededFrom032 = true
+            save()
+        } catch {
+            saveError = "Не удалось прочитать DefaultRules.json: \(error.localizedDescription)"
         }
     }
 
-    // MARK: my_ru.txt / my_en.txt
-
-    private func customFile(_ lang: Lang) -> URL {
-        folder.appendingPathComponent("my_\(lang.rawValue).txt")
-    }
-
-    fileprivate static func tokens(of line: Substring) -> [String] {
-        line.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "," }).map(String.init)
-    }
-
-    /// Read once and kept until we change the file or you reload the dictionaries (the Words pane asks on every render).
-    private var customCache: [Lang: [String]] = [:]
-
-    func customWords(_ lang: Lang) -> [String] {
-        if let cached = customCache[lang] { return cached }
-        let text = (try? String(contentsOf: customFile(lang), encoding: .utf8)) ?? ""
-        let words = text.split(separator: "\n", omittingEmptySubsequences: true)
-            .filter { !$0.hasPrefix("#") }
-            .flatMap { Self.tokens(of: $0) }
-        customCache[lang] = words
-        return words
-    }
-
-    /// The files may have been edited by hand: read them again next time.
-    func reloadCustomWords() { customCache = [:] }
-
-    func addCustomWord(_ word: String, lang: Lang) {
-        let w = word.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !w.isEmpty, !customWords(lang).contains(w) else { return }
-        let existing = (try? String(contentsOf: customFile(lang), encoding: .utf8)) ?? ""
-        let text = existing + (existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n") + w + "\n"
-        try? text.write(to: customFile(lang), atomically: true, encoding: .utf8)
-        customCache[lang] = nil
-        seenModification = modificationDate // our own change: no need to reload
-    }
-
-    func removeCustomWord(_ word: String, lang: Lang) {
-        guard let text = try? String(contentsOf: customFile(lang), encoding: .utf8) else { return }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
-            if line.hasPrefix("#") { return String(line) }
-            return Self.tokens(of: line).filter { $0 != word }.joined(separator: " ")
-        }
-        try? lines.joined(separator: "\n").write(to: customFile(lang), atomically: true, encoding: .utf8)
-        customCache[lang] = nil
-        seenModification = modificationDate
-    }
-
-    /// Creates editable my_ru.txt / my_en.txt on first launch (and fixes the hint line older versions wrote).
+    /// Creates editable my_ru.txt / my_en.txt on first launch.
     private func seedCustomLists() {
         for l in Lang.allCases {
-            let f = customFile(l)
-            if let text = try? String(contentsOf: f, encoding: .utf8), let first = text.split(separator: "\n").first,
-               first.contains("Перезагрузить словари") || first.contains("Reload dictionaries") || first.contains("→ Перезагрузить") || first.contains("→ Reload") {
-                let hint = l == .ru ? "# Мои русские слова: по одному или через пробел. Правки подхватываются сами."
-                                    : "# My English words: names, products, jargon. Changes are picked up automatically."
-                try? (hint + text.dropFirst(first.count)).write(to: f, atomically: true, encoding: .utf8)
-            }
+            let f = directory.appendingPathComponent("my_\(l.rawValue).txt")
             if !FileManager.default.fileExists(atPath: f.path) {
                 let header = l == .ru
-                    ? "# Мои русские слова: по одному или через пробел. Правки подхватываются сами.\n"
-                    : "# My English words: names, products, jargon. Changes are picked up automatically.\n"
+                    ? "# Мои русские слова: по одному или через пробел. После правки: меню → Перезагрузить словари.\n"
+                    : "# My English words: names, products, jargon. After editing: menu → Reload dictionaries.\n"
                 try? header.write(to: f, atomically: true, encoding: .utf8)
             }
         }

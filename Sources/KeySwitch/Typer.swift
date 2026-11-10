@@ -1,160 +1,137 @@
 import CoreGraphics
 import Foundation
 
-/// Posts synthetic keyboard events. Every event is tagged with `marker` so our own event tap
-/// lets it through untouched.
+/// Posts synthetic keyboard events tagged so the event tap lets them through.
+/// Context changes cancel a pending run; physical typing is held by SwitchEngine.
 final class Typer {
     static let marker: Int64 = 0x4B53_5749 // "KSWI"
 
     enum Action {
         case backspace(Int)
-        case forwardDelete(Int)
-        case left(Int)                   // ← n times: puts the caret back inside a retyped word
         case text(String)
-        case key(UInt16, CGEventFlags)   // e.g. Return with Shift
-        case command(UInt16)             // ⌘ + key code (8 = C, 9 = V)
+        case key(UInt16, CGEventFlags)
+        case command(UInt16)
         case pause(TimeInterval)
     }
 
-    private let queue = DispatchQueue(label: "keyswitch.typer")
+    private let queue: DispatchQueue
+    private let eventSink: (CGEvent) -> Void
+
+    init(queue: DispatchQueue = DispatchQueue(label: "keyswitch.typer"),
+         eventSink: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
+        self.queue = queue
+        self.eventSink = eventSink
+    }
+    private let lock = NSLock()
+    private var epoch: UInt64 = 0
     private let source = CGEventSource(stateID: .privateState)
     private let perCharDelay: useconds_t = 1_500
-    /// Most apps take a whole word in one Unicode event (at most 20 UTF-16 units); "compatible typing" in
-    /// Settings goes back to one character per event for the rare app that keeps only the first one.
-    private static let chunk = 20
-    private var compatible: Bool { Settings.shared.compatibleTyping }
-    private var keyDelay: useconds_t { compatible ? perCharDelay : 800 }
 
-    /// Frontmost app as last reported on the main thread; read here from the typing queue.
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var _frontPID: pid_t = 0
-    static var frontPID: pid_t {
-        get { lock.lock(); defer { lock.unlock() }; return _frontPID }
-        set { lock.lock(); _frontPID = newValue; lock.unlock() }
+    /// Called on the tap/main thread after a rewrite, preserving the original event fields.
+    func replay(_ event: CGEvent) {
+        event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
+        eventSink(event)
     }
-    /// Runs are numbered when they are asked for; `cancel()` stops every run asked for so far, even one
-    /// still waiting in the queue (a click right after a fix must not let it start typing).
-    nonisolated(unsafe) private var _requested = 0
-    nonisolated(unsafe) private var _cancelledThrough = 0
-    nonisolated(unsafe) private var current = 0
-    private var cancelled: Bool {
-        Self.lock.lock(); defer { Self.lock.unlock() }
-        return current <= _cancelledThrough
-    }
-    /// The app the current run started in: if another app comes to the front, the rest is not typed there.
-    nonisolated(unsafe) private var targetPID: pid_t = 0
 
-    /// Where `run`'s completion is called: the keyboard thread once the engine has one, else the main thread.
-    var deliver: (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) }
-
-    /// Self-test only: actions go here, synchronously, instead of to the system.
-    var sink: ((Action) -> Void)?
-
-    /// Stops the current run before its next key (a click elsewhere, focus moved).
     func cancel() {
-        Self.lock.lock(); _cancelledThrough = _requested; Self.lock.unlock()
+        lock.lock()
+        epoch &+= 1
+        lock.unlock()
     }
 
-    /// `completion(true)` when every action was posted, `false` when the run stopped early
-    /// because focus left the app or `cancel()` was called.
-    func run(_ actions: [Action], completion: ((Bool) -> Void)? = nil) {
-        if let sink {
-            actions.forEach(sink)
-            completion?(true)
-            return
-        }
-        let pid = Self.frontPID
-        Self.lock.lock(); _requested += 1; let number = _requested; Self.lock.unlock()
+    /// Main-thread focus observation; workers never query NSWorkspace.
+    func updateFrontmostPID(_ pid: pid_t?) {
+        lock.lock()
+        activePID = pid
+        lock.unlock()
+    }
+
+    private var activePID: pid_t?
+
+    func run(_ actions: [Action], targetPID: pid_t? = nil, completion: ((Bool) -> Void)? = nil) {
+        lock.lock()
+        let runEpoch = epoch
+        let targetPID = targetPID ?? activePID
+        lock.unlock()
         queue.async {
-            Self.lock.lock(); self.current = number; Self.lock.unlock()
-            self.targetPID = pid
             var finished = true
-            for a in actions where finished { finished = self.perform(a) }
-            if let completion { self.deliver { completion(finished) } }
+            for action in actions where finished { finished = self.perform(action, epoch: runEpoch, targetPID: targetPID) }
+            if let completion { DispatchQueue.main.async { completion(finished && self.isCurrent(runEpoch, targetPID: targetPID)) } }
         }
     }
 
-    private var mayContinue: Bool {
-        !cancelled && (targetPID == 0 || Self.frontPID == targetPID)
+    private func isCurrent(_ runEpoch: UInt64, targetPID: pid_t?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        // An unknown target is never "current": never post into an unidentified app.
+        guard let targetPID else { return false }
+        return epoch == runEpoch && activePID == targetPID
     }
 
-    private func perform(_ a: Action) -> Bool {
-        guard mayContinue else { return false }
-        switch a {
-        case .backspace(let n):
-            for _ in 0..<max(0, n) {
-                guard mayContinue else { return false }
-                post(key: 51, down: true, flags: [])
-                post(key: 51, down: false, flags: [])
-                usleep(keyDelay)
-            }
-        case .forwardDelete(let n), .left(let n):
-            let code: UInt16 = if case .left = a { 123 } else { 117 }
-            for _ in 0..<max(0, n) {
-                guard mayContinue else { return false }
-                post(key: code, down: true, flags: [])
-                post(key: code, down: false, flags: [])
+    private func perform(_ action: Action, epoch runEpoch: UInt64, targetPID: pid_t?) -> Bool {
+        switch action {
+        case .backspace(let count):
+            for _ in 0..<max(0, count) {
+                guard postKeyPair(key: 51, flags: [], epoch: runEpoch, targetPID: targetPID) else { return false }
                 usleep(perCharDelay)
             }
-        case .text(let s):
-            return type(s)
+        case .text(let string):
+            for character in string {
+                if character == "\n" || character == "\r" {
+                    guard postKeyPair(key: 36, flags: .maskShift, epoch: runEpoch, targetPID: targetPID) else { return false }
+                } else {
+                    guard postUnicodePair(String(character), epoch: runEpoch, targetPID: targetPID) else { return false }
+                }
+                usleep(perCharDelay)
+            }
         case .key(let code, let flags):
-            post(key: code, down: true, flags: flags)
-            post(key: code, down: false, flags: flags)
+            guard postKeyPair(key: code, flags: flags, epoch: runEpoch, targetPID: targetPID) else { return false }
             usleep(perCharDelay)
         case .command(let code):
-            post(key: code, down: true, flags: .maskCommand)
-            post(key: code, down: false, flags: .maskCommand)
+            guard postKeyPair(key: code, flags: .maskCommand, epoch: runEpoch, targetPID: targetPID) else { return false }
             usleep(20_000)
-        case .pause(let t):
-            usleep(useconds_t(t * 1_000_000))
+        case .pause(let interval):
+            var remaining = max(0, interval)
+            while remaining > 0 {
+                guard isCurrent(runEpoch, targetPID: targetPID) else { return false }
+                let step = min(remaining, 0.01)
+                usleep(useconds_t(step * 1_000_000))
+                remaining -= step
+            }
         }
+        return isCurrent(runEpoch, targetPID: targetPID)
+    }
+
+    /// Check before each pair; once started, always post key-up even if cancelled meanwhile.
+    /// Do not hold a lock while posting: the event tap may run on the main thread.
+    private func postKeyPair(key: UInt16, flags: CGEventFlags, epoch runEpoch: UInt64, targetPID: pid_t?) -> Bool {
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) else { return false }
+        for event in [down, up] {
+            event.flags = flags
+            event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
+        }
+        guard isCurrent(runEpoch, targetPID: targetPID) else { return false }
+        eventSink(down)
+        eventSink(up)
         return true
     }
 
-    private func post(key: UInt16, down: Bool, flags: CGEventFlags) {
-        guard let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else { return }
-        e.flags = flags
-        e.setIntegerValueField(.eventSourceUserData, value: Typer.marker)
-        e.post(tap: .cghidEventTap)
-    }
-
-    /// Types characters directly as Unicode, independent of the active layout: whole runs of up to 20 UTF-16
-    /// units per event (never splitting a character), or one character per event in compatible mode.
-    private func type(_ s: String) -> Bool {
-        var run: [UInt16] = []
-        func flush() {
-            guard !run.isEmpty else { return }
-            postUnicode(run)
-            run = []
-            usleep(compatible ? perCharDelay : 1_000)
-        }
-        for ch in s {
-            guard mayContinue else { return false }
-            if ch == "\n" || ch == "\r" {
-                flush()
-                post(key: 36, down: true, flags: .maskShift) // Shift+Return = new line, never "send"
-                post(key: 36, down: false, flags: .maskShift)
-                usleep(perCharDelay)
-                continue
+    /// Unicode is independent of the active keyboard layout.
+    private func postUnicodePair(_ string: String, epoch runEpoch: UInt64, targetPID: pid_t?) -> Bool {
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return false }
+        let units = Array(string.utf16)
+        for event in [down, up] {
+            event.flags = []
+            units.withUnsafeBufferPointer { buffer in
+                event.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress)
             }
-            let units = Array(String(ch).utf16)
-            if compatible || run.count + units.count > Self.chunk { flush() }
-            run += units
+            event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
         }
-        flush()
+        guard isCurrent(runEpoch, targetPID: targetPID) else { return false }
+        eventSink(down)
+        eventSink(up)
         return true
-    }
-
-    private func postUnicode(_ units: [UInt16]) {
-        for down in [true, false] {
-            guard let e = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
-            e.flags = []
-            units.withUnsafeBufferPointer { buf in
-                e.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
-            }
-            e.setIntegerValueField(.eventSourceUserData, value: Typer.marker)
-            e.post(tap: .cghidEventTap)
-        }
     }
 }
