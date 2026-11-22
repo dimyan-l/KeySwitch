@@ -53,7 +53,18 @@ echo "→ Самопроверка словарей:"
 
 if [[ "${1:-}" == "--install" ]]; then
   STAGING="$(mktemp -d /Applications/.KeySwitch-install.XXXXXX)"
-  trap 'rm -rf "$STAGING"' EXIT
+  cleanup_install() {
+    if [[ -d "$STAGING/previous.app" && ! -e /Applications/KeySwitch.app ]]; then
+      if ! mv "$STAGING/previous.app" /Applications/KeySwitch.app; then
+        echo "Предыдущая версия сохранена в $STAGING/previous.app" >&2
+        return
+      fi
+    fi
+    rm -rf "$STAGING"
+  }
+  trap cleanup_install EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   ditto "$APP" "$STAGING/KeySwitch.app"
   codesign --verify --deep --strict "$STAGING/KeySwitch.app"
   pkill -TERM -x KeySwitch 2>/dev/null || true
