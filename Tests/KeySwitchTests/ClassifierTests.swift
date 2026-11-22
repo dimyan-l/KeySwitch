@@ -93,7 +93,27 @@ final class ClassifierTests: XCTestCase {
         XCTAssertEqual(SpellCorrector.correction(for: "превет", alternative: "", model: ru, other: en), "привет")
         XCTAssertEqual(SpellCorrector.correction(for: "recieve", alternative: "", model: en, other: ru), "receive")
         XCTAssertNil(SpellCorrector.correction(for: "привет", alternative: "", model: ru, other: en))
-        XCTAssertNil(SpellCorrector.correction(for: "Превет", alternative: "", model: ru, other: en))
+        XCTAssertEqual(SpellCorrector.correction(for: "Превет", alternative: "", model: ru, other: en), "Привет")
+        XCTAssertNil(SpellCorrector.correction(for: "ПРЕВЕТ", alternative: "", model: ru, other: en))
+    }
+
+    func testCommonTyposAreCorrected() throws {
+        let c = try classifier()
+        let ru = try XCTUnwrap(c.models[.ru])
+        let en = try XCTUnwrap(c.models[.en])
+        for (typed, expected) in [("teh", "the"), ("hte", "the"), ("realy", "really"), ("adress", "address"),
+                                  ("Thnaks", "Thanks")] {
+            XCTAssertEqual(SpellCorrector.correction(for: typed, alternative: "", model: en, other: ru), expected, typed)
+        }
+        for (typed, expected) in [("здраствуйте", "здравствуйте"), ("спосибо", "спасибо"), ("Сегоня", "Сегодня")] {
+            XCTAssertEqual(SpellCorrector.correction(for: typed, alternative: "", model: ru, other: en), expected, typed)
+        }
+        for word in ["кода", "собака", "щас", "and", "nad", "cat", "код"] {
+            let model = word.first!.isASCII ? en : ru
+            XCTAssertNil(SpellCorrector.correction(for: word, alternative: "", model: model, other: nil), word)
+        }
+        XCTAssertTrue(SpellCorrector.areNeighbours("е", "н"))
+        XCTAssertFalse(SpellCorrector.areNeighbours("q", "p"))
     }
 
     func testReportedTyposAndCaretWord() throws {
@@ -116,4 +136,79 @@ final class ClassifierTests: XCTestCase {
         XCTAssertNil(CaretWordRange.find(in: String(longWord.suffix(32)), caretUTF16: 32,
                                           leadingTruncated: true))
     }
+
+    func testConfidentNgramAndWrongLayoutTypos() throws {
+        let c = try classifier()
+        // Non-dictionary inflected Russian words & slang should be confident n-gram wins.
+        for (typed, expected) in [
+            ("gjabrcbk", "пофиксил"),
+            ("gjlcrf;b", "подскажи"),
+            ("j,yjdbkcz", "обновился"),
+            ("jngbibntcm", "отпишитесь"),
+            ("pfltgkjbkb", "задеплоили"),
+            ("pfvth;bk", "замержил"),
+            ("[jnabrc", "хотфикс"),
+        ] {
+            let plan = c.plan(current: typed, alternative: SelfTest.flip(typed, to: .ru), currentLang: .en)
+            XCTAssertTrue(plan.decision.convert, typed)
+            XCTAssertTrue(plan.decision.confident, "\(typed) should not be held back by cautiousMode")
+            XCTAssertEqual(plan.prefix + plan.alternativeWord + plan.suffix, expected, typed)
+        }
+
+        // Non-dictionary English words typed in RU should also be confident.
+        for (typed, expected) in [
+            ("ьшскщыукмшсуы", "microservices"),
+            ("куафсещкштп", "refactoring"),
+        ] {
+            let plan = c.plan(current: typed, alternative: SelfTest.flip(typed, to: .en), currentLang: .ru)
+            XCTAssertTrue(plan.decision.convert, typed)
+            XCTAssertTrue(plan.decision.confident, typed)
+            XCTAssertEqual(plan.alternativeWord, expected, typed)
+        }
+    }
+
+    func testLeadingAndSurroundingPunctuationAndContext() throws {
+        let c = try classifier()
+        let quoted = c.plan(current: "\"ghbdtn\"", alternative: "ЭприветЭ", currentLang: .en)
+        XCTAssertTrue(quoted.decision.convert)
+        XCTAssertEqual(quoted.prefix + quoted.alternativeWord + quoted.suffix, "\"привет\"")
+
+        let openQuoted = c.plan(current: "\"ghbdtn", alternative: "Эпривет", currentLang: .en)
+        XCTAssertTrue(openQuoted.decision.convert)
+        XCTAssertEqual(openQuoted.prefix + openQuoted.alternativeWord + openQuoted.suffix, "\"привет")
+
+        let goodRussianBracket = c.plan(current: "[jhjij", alternative: "хорошо", currentLang: .en)
+        XCTAssertTrue(goodRussianBracket.decision.convert)
+        XCTAssertEqual(goodRussianBracket.prefix + goodRussianBracket.alternativeWord + goodRussianBracket.suffix, "хорошо")
+
+        // Previous word leaning RU lowers the threshold for borderline words like "htrhenth" ("рекрутер").
+        XCTAssertTrue(c.leansTowardOther(current: "z", alternative: "я", currentLang: .en))
+        XCTAssertTrue(c.leansTowardOther(current: "dj", alternative: "во", currentLang: .en))
+        let withContext = c.plan(current: "htrhenth", alternative: "рекрутер", currentLang: .en, contextLang: .ru)
+        XCTAssertTrue(withContext.decision.convert)
+        XCTAssertTrue(c.shouldRetroFix(current: "dj", alternative: "во", currentLang: .en))
+    }
+
+    func testAutomaticSpellingCoversMixedLayoutCaseAndPunctuation() throws {
+        let c = try classifier()
+        let typo = c.plan(current: "ghbdnt", alternative: "привте", currentLang: .en)
+        var rules = RuleBook()
+        XCTAssertEqual(AutomaticCorrection.layoutWithSpelling(typo, currentLang: .en, classifier: c,
+                                                                rules: rules)?.alternativeWord, "привет")
+        _ = rules.add("ghbdnt", lang: .en, kind: .layout, result: nil, source: .manual)
+        XCTAssertNil(AutomaticCorrection.layoutWithSpelling(typo, currentLang: .en, classifier: c, rules: rules))
+
+        let ru = try XCTUnwrap(c.models[.ru])
+        let en = try XCTUnwrap(c.models[.en])
+        let capital = AutomaticCorrection.spelling(current: "ПРивет", alternative: "GHbdtn", model: ru, other: en, rules: rules)
+        XCTAssertEqual(capital?.text, "Привет")
+        XCTAssertEqual(capital?.kind, .caseFix)
+        XCTAssertEqual(AutomaticCorrection.spelling(current: "почемуто", alternative: "", model: ru, other: en,
+                                                     rules: rules)?.text, "почему-то")
+        XCTAssertEqual(AutomaticCorrection.spelling(current: "recieve.", alternative: "кусшумую", model: en, other: ru,
+                                                     rules: rules)?.text, "receive.")
+        XCTAssertNil(AutomaticCorrection.spelling(current: "GitHub", alternative: "", model: en, other: ru, rules: rules))
+        XCTAssertNil(AutomaticCorrection.spelling(current: "some.name", alternative: "", model: en, other: ru, rules: rules))
+    }
 }
+

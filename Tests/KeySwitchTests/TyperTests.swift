@@ -9,6 +9,76 @@ final class TyperTests: XCTestCase {
         return UserStore(directory: directory, bundledRulesURL: nil)
     }
 
+    func testHotkeyPressedDuringRewriteIsHandledOnce() {
+        let queue = DispatchQueue(label: "test.bufferedHotkey")
+        queue.suspend()
+        var posted: [CGEvent] = []
+        let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
+        let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
+        let called = expectation(description: "selection command handled")
+        engine.onHotkey = { hotkey in
+            XCTAssertEqual(hotkey, .flipSelection)
+            XCTAssertFalse(engine.isTyping)
+            called.fulfill()
+        }
+        engine.perform([.backspace(1), .text("x")])
+        for repeatFlag: Int64 in [0, 1] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: 15, keyDown: true)!
+            event.flags = [.maskControl, .maskAlternate]
+            event.setIntegerValueField(.keyboardEventAutorepeat, value: repeatFlag)
+            XCTAssertNil(engine.handle(type: .keyDown, event: event))
+        }
+        queue.resume()
+        wait(for: [called], timeout: 2)
+        engine.onHotkey = nil
+        XCTAssertFalse(posted.contains { $0.getIntegerValueField(.keyboardEventKeycode) == 15 })
+    }
+
+    func testBufferedWordCanBeCorrectedInSpellingOnlyMode() throws {
+        let layouts = KeyboardLayouts()
+        let source = layouts.current()
+        let language = try XCTUnwrap(source.lang)
+        let word = language == .en ? "recieve" : "почемуто"
+        let codes = try word.map { letter in
+            try XCTUnwrap((UInt16(0)...50).first {
+                layouts.character(Stroke(keyCode: $0, shift: false, caps: false), layout: source.layout) == String(letter)
+            })
+        }
+        let suite = "test.bufferedSpelling.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: defaults)
+        settings.autoEnabled = false
+        settings.spellEnabled = true
+        let queue = DispatchQueue(label: "test.bufferedSpelling")
+        let replayed = expectation(description: "next keystroke delivered after spelling rewrite")
+        let nextLetter: UInt16 = 6 // Z/Я appears in neither test word.
+        var keyDowns: [UInt16] = []
+        let typer = Typer(queue: queue, eventSink: { event in
+            guard event.type == .keyDown else { return }
+            let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            keyDowns.append(code)
+            if code == nextLetter { replayed.fulfill() }
+        })
+        let engine = SwitchEngine(layouts: layouts, store: makeStore(), typer: typer, settings: settings, frontmostPID: { 123 })
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        engine.classifier = try Classifier.load(dictionaryDir: root.appendingPathComponent("Resources/Dictionaries"),
+                                                userDir: nil, learned: [:])
+        queue.suspend()
+        engine.perform([])
+        for code in codes + [49, nextLetter] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!
+            XCTAssertNil(engine.handle(type: .keyDown, event: event))
+        }
+        queue.resume()
+        wait(for: [replayed], timeout: 3)
+        XCTAssertEqual(Array(keyDowns.prefix(codes.count)), codes)
+        XCTAssertTrue(keyDowns.dropFirst(codes.count).contains(51))
+        XCTAssertEqual(Array(keyDowns.suffix(2)), [49, nextLetter])
+        XCTAssertEqual(engine.trackedWordLength, 1)
+        XCTAssertFalse(engine.isTyping)
+    }
+
     func testBufferedKeyUpsAndModifierReleasePreserveSemanticUndo() {
         for releaseCode: UInt16? in [nil, 61, 56] {
             let queue = DispatchQueue(label: "test.undoAfterRelease")
@@ -16,9 +86,8 @@ final class TyperTests: XCTestCase {
             var posted: [CGEvent] = []
             let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
             let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
-            let stroke = Stroke(keyCode: 0, shift: false, caps: false)
-            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b", strokes: [stroke],
-                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b",
+                language: .en))
             let up = CGEvent(keyboardEventSource: nil, virtualKey: 49, keyDown: false)!
             XCTAssertNil(engine.handle(type: .keyUp, event: up))
             if let code = releaseCode {
@@ -57,8 +126,7 @@ final class TyperTests: XCTestCase {
             let typer = Typer(queue: queue, eventSink: { _ in })
             let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
             XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b",
-                strokes: [Stroke(keyCode: 0, shift: false, caps: false)],
-                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+                language: .en))
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!
             if code == 57 { event.type = .flagsChanged; event.flags = .maskAlphaShift }
             XCTAssertNil(engine.handle(type: event.type, event: event))
@@ -67,14 +135,40 @@ final class TyperTests: XCTestCase {
             queue.async { DispatchQueue.main.async { drained.fulfill() } }
             wait(for: [drained], timeout: 2)
             queue.suspend()
+            // A replayed letter now starts the next tracked word, so Right Option converts that
+            // word instead of undoing the earlier correction.
+            let expectsWordFix = code == 0 && engine.layouts.currentLang != nil && engine.trackedWordLength == 1
             engine.manualFix()
-            XCTAssertFalse(engine.isTyping, "Replayed text/navigation/Caps Lock must not leave stale undo")
+            XCTAssertEqual(engine.isTyping, expectsWordFix, "Replayed text/navigation/Caps Lock must not leave stale undo")
             engine.cancelPendingTyping()
             let cancelled = expectation(description: "no stale undo worker")
             queue.resume()
             queue.async { DispatchQueue.main.async { cancelled.fulfill() } }
             wait(for: [cancelled], timeout: 2)
         }
+    }
+
+    func testLettersTypedDuringRewriteStartTheNextTrackedWord() throws {
+        let layouts = KeyboardLayouts()
+        try XCTSkipIf(layouts.currentLang == nil || !layouts.hasBothLayouts, "needs RU and EN layouts")
+        let queue = DispatchQueue(label: "test.trackReplay")
+        queue.suspend()
+        var posted: [CGEvent] = []
+        let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
+        let engine = SwitchEngine(layouts: layouts, store: makeStore(), typer: typer, frontmostPID: { 123 })
+        XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b",
+            language: .en))
+        for code: UInt16 in [40, 3, 15] { // k f r -> "как" on ЙЦУКЕН
+            XCTAssertNil(engine.handle(type: .keyDown, event: CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!))
+        }
+        let drained = expectation(description: "held letters replayed")
+        queue.resume()
+        queue.async { DispatchQueue.main.async { drained.fulfill() } }
+        wait(for: [drained], timeout: 2)
+        XCTAssertFalse(engine.isTyping)
+        XCTAssertEqual(engine.trackedWordLength, 3, "Held letters must be part of the next word")
+        XCTAssertEqual(posted.suffix(3).map { $0.getIntegerValueField(.keyboardEventKeycode) }, [40, 3, 15])
+        engine.cancelPendingTyping()
     }
 
     func testPhysicalKeyDuringRewritePreservesReplacementDelimiterAndInputOrder() {
@@ -290,4 +384,53 @@ final class TyperTests: XCTestCase {
         }
         wait(for: [nextRun], timeout: 2)
     }
+
+    func testBackspaceAfterSpaceRestoresPreviousWord() throws {
+        let layouts = KeyboardLayouts()
+        try XCTSkipIf(layouts.currentLang == nil, "needs an active RU/EN layout")
+        let engine = SwitchEngine(layouts: layouts, store: makeStore(), frontmostPID: { 123 })
+        for code: UInt16 in [0, 1] { // two letter keys
+            _ = engine.handle(type: .keyDown, event: CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!)
+        }
+        XCTAssertEqual(engine.trackedWordLength, 2)
+        // Space moves the word into prev without converting (classifier is nil).
+        _ = engine.handle(type: .keyDown, event: CGEvent(keyboardEventSource: nil, virtualKey: 49, keyDown: true)!)
+        XCTAssertEqual(engine.trackedWordLength, 0)
+        // Deleting the trailing Space restores the tracked word for continued editing.
+        _ = engine.handle(type: .keyDown, event: CGEvent(keyboardEventSource: nil, virtualKey: 51, keyDown: true)!)
+        XCTAssertEqual(engine.trackedWordLength, 2)
+    }
+    func testRoutesBothHalvesToTheSamePIDEvenWhenFocusChangesDuringPosting() {
+        var posted: [(CGEventType, pid_t)] = []
+        weak var observedTyper: Typer?
+        let typer = Typer(targetedSink: { event, pid in
+            posted.append((event.type, pid))
+            if event.type == .keyDown { observedTyper?.updateFrontmostPID(456) }
+        }, protectedInput: { false })
+        observedTyper = typer
+        typer.updateFrontmostPID(123)
+        let ended = expectation(description: "late focus change cancels further emission")
+        typer.run([.text("hello")]) { success in
+            XCTAssertFalse(success)
+            ended.fulfill()
+        }
+        wait(for: [ended], timeout: 2)
+        XCTAssertEqual(posted.map { $0.0 }, [.keyDown, .keyUp])
+        XCTAssertEqual(posted.map { $0.1 }, [123, 123])
+    }
+
+    func testProtectedInputBlocksNewPostsAndReplay() {
+        let typer = Typer(targetedSink: { _, _ in XCTFail("Secure Input must block event delivery") },
+                          protectedInput: { true })
+        typer.updateFrontmostPID(123)
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 49, keyDown: true)!
+        typer.replay(event, to: 123)
+        let ended = expectation(description: "protected")
+        typer.run([.backspace(1), .text("text")]) { success in
+            XCTAssertFalse(success)
+            ended.fulfill()
+        }
+        wait(for: [ended], timeout: 2)
+    }
+
 }
