@@ -18,6 +18,9 @@ final class ClassifierTests: XCTestCase {
         let plan = try classifier().plan(current: "gracias", alternative: "gracias", currentLang: .en)
         XCTAssertTrue(plan.decision.convert)
         XCTAssertEqual(plan.alternativeWord + plan.suffix, "gracias")
+        XCTAssertTrue(plan.decision.confident, "The default cautious mode must switch for a clear shared-key word")
+        let english = try classifier().decide(current: "hello", alternative: "hello", currentLang: .es)
+        XCTAssertTrue(english.convert && english.confident)
     }
 
     func testDifferentCharacterIsCorrected() throws {
