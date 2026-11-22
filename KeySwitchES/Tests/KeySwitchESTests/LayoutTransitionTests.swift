@@ -24,7 +24,8 @@ final class LayoutTransitionTests: XCTestCase {
         return event
     }
 
-    private func engine(layouts: KeyboardLayouts, typer: Typer, protectedInput: @escaping () -> Bool = { false }) -> SwitchEngine {
+    private func engine(layouts: KeyboardLayouts, typer: Typer, frontmostPID: @escaping () -> pid_t? = { 123 },
+                        protectedInput: @escaping () -> Bool = { false }) -> SwitchEngine {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let english = LanguageModel(lang: .en)
@@ -35,7 +36,8 @@ final class LayoutTransitionTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         let engine = SwitchEngine(layouts: layouts, store: UserStore(directory: dir, bundledRulesURL: nil),
-                                  typer: typer, settings: Settings(defaults: defaults), frontmostPID: { 123 }, protectedInput: protectedInput)
+                                  typer: typer, settings: Settings(defaults: defaults), frontmostPID: frontmostPID,
+                                  protectedInput: protectedInput)
         engine.classifier = Classifier(models: [.en: english, .es: spanish])
         return engine
     }
@@ -92,5 +94,34 @@ final class LayoutTransitionTests: XCTestCase {
         secure = true
         XCTAssertNotNil(engine.handle(type: .keyDown, event: key(49)))
         XCTAssertEqual(engine.trackedWordLength, 0)
+    }
+
+    func testClickReleasesHeldKeystrokesInOrderOnlyToTheUnchangedFocus() throws {
+        let click = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                          mouseCursorPosition: .zero, mouseButton: .left))
+        for pidAfterClick: pid_t in [123, 456] {
+            let queue = DispatchQueue(label: "keyswitches.click-test")
+            queue.suspend()
+            let typer = Typer(queue: queue, eventSink: { _ in XCTFail("A cancelled rewrite must not post") },
+                              protectedInput: { false })
+            var activePID: pid_t = 123
+            let layouts = layouts(readSource: { self.en })
+            let engine = engine(layouts: layouts, typer: typer, frontmostPID: { activePID })
+            engine.perform([.backspace(1)])
+            XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
+            XCTAssertNil(engine.handle(type: .keyDown, event: key(4, text: "h")))
+            activePID = pidAfterClick
+
+            var forwarded: [Int64] = []
+            let mouse = engine.handle(type: .leftMouseDown, event: click) { event in
+                XCTAssertEqual(event.getIntegerValueField(.eventSourceUserData), Typer.marker)
+                forwarded.append(event.getIntegerValueField(.keyboardEventKeycode))
+            }
+            XCTAssertNotNil(mouse)
+            XCTAssertEqual(forwarded, pidAfterClick == 123 ? [0, 4] : [])
+            XCTAssertFalse(engine.isTyping)
+            queue.resume()
+            queue.sync {}
+        }
     }
 }

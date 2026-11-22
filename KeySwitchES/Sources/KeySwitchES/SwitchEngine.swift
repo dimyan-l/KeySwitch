@@ -19,7 +19,7 @@ enum Hotkey: Equatable {
 private func tapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     guard let refcon else { return Unmanaged.passUnretained(event) }
     let engine = Unmanaged<SwitchEngine>.fromOpaque(refcon).takeUnretainedValue()
-    return engine.handle(type: type, event: event)
+    return engine.handle(type: type, event: event) { $0.tapPostEvent(proxy) }
 }
 
 /// Watches keystrokes, keeps the current word as key codes, decides on word end whether it was
@@ -54,6 +54,7 @@ final class SwitchEngine {
     private var last: Correction?
     private var busy = false
     private var pendingInput: [(event: CGEvent, sourceID: String?)] = []
+    private var pendingBackspace: CGEvent?
     private var requestedSourceID: String?
     private var userRequestedInputSource = false
     private var idleActions: [() -> Void] = []
@@ -136,6 +137,7 @@ final class SwitchEngine {
         typingRunID &+= 1
         typer.cancel()
         pendingInput.removeAll()
+        pendingBackspace = nil
         requestedSourceID = nil
         idleActions.removeAll()
         if let tap {
@@ -163,6 +165,7 @@ final class SwitchEngine {
         typingRunID &+= 1
         typer.cancel()
         pendingInput.removeAll()
+        pendingBackspace = nil
         requestedSourceID = nil
         idleActions.removeAll()
         busy = false
@@ -199,9 +202,32 @@ final class SwitchEngine {
         untrackedToken = true
     }
 
+    private func cancelTypingAndReleaseKeys(postBeforeCurrentEvent: ((CGEvent) -> Void)?) {
+        let pid = busy ? typingPID : nil
+        let backspace = pendingBackspace
+        let queuedKeys = pendingInput
+        cancelPendingTyping()
+        disregardWord()
+        guard let pid, frontmostPID() == pid, typer.isTargetActive(pid), !protectedInput() else { return }
+
+        // When called from the tap, replay before the physical click or key is delivered.
+        // Posting directly to the app after a click could type into a newly focused field.
+        func release(_ event: CGEvent) {
+            if let postBeforeCurrentEvent {
+                event.setIntegerValueField(.eventSourceUserData, value: Typer.marker)
+                postBeforeCurrentEvent(event)
+            } else {
+                typer.replay(event, to: pid)
+            }
+        }
+        if let backspace { release(backspace) }
+        for held in queuedKeys { release(held.event) }
+    }
+
     // MARK: - Event handling
 
-    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    func handle(type: CGEventType, event: CGEvent,
+                postBeforeCurrentEvent: ((CGEvent) -> Void)? = nil) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         if type == .tapDisabledByUserInput {
             stop()
@@ -233,8 +259,7 @@ final class SwitchEngine {
             return pass
         }
         if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) {
-            cancelPendingTyping()
-            disregardWord()
+            cancelTypingAndReleaseKeys(postBeforeCurrentEvent: postBeforeCurrentEvent)
             return pass
         }
         if let readFrontmostBundleID {
@@ -263,14 +288,8 @@ final class SwitchEngine {
             }
             // Abort rather than hold the keyboard indefinitely. Release held input only
             // to the still-active target, without feeding it back to the classifier.
-            let pending = pendingInput
-            let pid = typingPID
-            KeyboardDiagnostics.record(.queueLimit, buffered: pending.count)
-            cancelPendingTyping()
-            disregardWord()
-            if let pid, frontmostPID() == pid {
-                for held in pending { typer.replay(held.event, to: pid) }
-            }
+            KeyboardDiagnostics.record(.queueLimit, buffered: pendingInput.count)
+            cancelTypingAndReleaseKeys(postBeforeCurrentEvent: postBeforeCurrentEvent)
             return pass
         }
 
@@ -511,16 +530,21 @@ final class SwitchEngine {
         }
 
         // Correct a previous word only if its physical keys would change its spelling.
-        var newText = plan.prefix + plan.alternativeWord + plan.suffix
+        let correctedWord = plan.prefix + plan.alternativeWord + plan.suffix
+        var newText = correctedWord
         var originalText = curStr
         if !cautious, curStr != altStr, plan.prefix.isEmpty, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
             let pc = layouts.string(p.strokes, layout: cur.layout)
             let pa = layouts.string(p.strokes, in: target)
-            if pc.count == p.strokes.count, pa.count == p.strokes.count, pc != pa,
-               !store.rules.blocks(pc, lang: curLang, kind: .layout),
-               classifier.shouldRetroFix(current: pc, alternative: pa, currentLang: curLang) {
-                newText = pa + " " + plan.alternativeWord + plan.suffix
-                originalText = pc + " " + curStr
+            if pc.count == p.strokes.count, pa.count == p.strokes.count, pc != pa {
+                let previousPlan = classifier.plan(current: pc, alternative: pa, currentLang: curLang)
+                let correctedPrevious = previousPlan.prefix + previousPlan.alternativeWord + previousPlan.suffix
+                if correctedPrevious != pc, !store.rules.blocks(pc, lang: curLang, kind: .layout),
+                   classifier.shouldRetroFix(current: previousPlan.currentWord,
+                                             alternative: previousPlan.alternativeWord, currentLang: curLang) {
+                    newText = correctedPrevious + " " + correctedWord
+                    originalText = pc + " " + curStr
+                }
             }
         }
 
@@ -534,7 +558,7 @@ final class SwitchEngine {
 
         last = Correction(typedText: newText, originalText: originalText,
                           from: curLang, originalWord: currentCore, kind: .layout)
-        prev = plan.alternativeWord == altStr ? (strokes, target) : nil
+        prev = correctedWord == altStr ? (strokes, target) : nil
         return true
     }
 
@@ -775,6 +799,7 @@ final class SwitchEngine {
         typingStartedAt = ProcessInfo.processInfo.systemUptime
         typer.updateFrontmostPID(pid)
         busy = true
+        pendingBackspace = held
         let deadline = DispatchTime.now() + .milliseconds(45)
 
         func complete(_ verified: Bool) {
@@ -783,6 +808,7 @@ final class SwitchEngine {
                 cancelPendingTyping()
                 return
             }
+            pendingBackspace = nil
             if verified, !userRequestedInputSource, DispatchTime.now() < deadline {
                 KeyboardDiagnostics.record(.undoVerified)
                 disregardWord()

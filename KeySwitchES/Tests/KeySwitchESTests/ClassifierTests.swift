@@ -29,6 +29,17 @@ final class ClassifierTests: XCTestCase {
         XCTAssertEqual(plan.alternativeWord + plan.suffix, "niño")
     }
 
+    func testLayoutCorrectionPreservesPunctuationAtBothEnds() throws {
+        let c = try classifier()
+        let plan = c.plan(current: "(ni;o?", alternative: ")niño_", currentLang: .en)
+        XCTAssertTrue(plan.decision.convert && plan.decision.confident)
+        XCTAssertEqual(plan.prefix + plan.alternativeWord + plan.suffix, "(niño?")
+        let shared = c.plan(current: "gracias?", alternative: "gracias_", currentLang: .en)
+        XCTAssertTrue(shared.decision.convert && shared.decision.confident)
+        XCTAssertEqual(shared.prefix + shared.alternativeWord + shared.suffix, "gracias?")
+        XCTAssertFalse(c.plan(current: "?!", alternative: "_!", currentLang: .en).decision.convert)
+    }
+
     func testUnknownSharedLetterKeysDoNotTriggerSwitch() throws {
         let plan = try classifier().plan(current: "foobarqux", alternative: "foobarqux", currentLang: .en)
         XCTAssertFalse(plan.decision.convert)

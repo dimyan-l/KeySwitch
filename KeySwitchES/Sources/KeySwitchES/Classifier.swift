@@ -233,12 +233,36 @@ final class Classifier {
     /// At a word boundary, keep leading/trailing punctuation runs when the inner
     /// reading is a clear correction and the full alternative is not a known word.
     func plan(current: String, alternative: String, currentLang: Lang, contextLang: Lang? = nil) -> CorrectionPlan {
-        let full = decide(current: current, alternative: alternative, currentLang: currentLang, contextLang: contextLang)
         let currentChars = Array(current)
         let alternativeChars = Array(alternative)
         guard currentChars.count == alternativeChars.count else {
-            return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
+            return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "",
+                                  decision: decide(current: current, alternative: alternative,
+                                                   currentLang: currentLang, contextLang: contextLang))
         }
+
+        // Punctuation whose alternate key isn't a letter is outside the word.
+        // Keep the typed marks, even when a layout maps them to different symbols.
+        let paired = Array(zip(currentChars, alternativeChars))
+        let prefixCount = paired.prefix(while: Self.isLiteralPunctuation).count
+        let suffixCount = paired.dropFirst(prefixCount).reversed().prefix(while: Self.isLiteralPunctuation).count
+        let body = prefixCount..<(currentChars.count - suffixCount)
+        let inner = planWord(current: String(currentChars[body]), alternative: String(alternativeChars[body]),
+                             currentLang: currentLang, contextLang: contextLang)
+        return CorrectionPlan(prefix: String(currentChars.prefix(prefixCount)) + inner.prefix,
+                              currentWord: inner.currentWord, alternativeWord: inner.alternativeWord,
+                              suffix: inner.suffix + String(currentChars.suffix(suffixCount)), decision: inner.decision)
+    }
+
+    private static func isLiteralPunctuation(_ pair: (Character, Character)) -> Bool {
+        let (typed, alternate) = pair
+        return (typed.isPunctuation || typed.isSymbol) && !alternate.isLetter
+    }
+
+    private func planWord(current: String, alternative: String, currentLang: Lang, contextLang: Lang?) -> CorrectionPlan {
+        let full = decide(current: current, alternative: alternative, currentLang: currentLang, contextLang: contextLang)
+        let currentChars = Array(current)
+        let alternativeChars = Array(alternative)
         let fullAlt = models[currentLang.other]?.core(normalizeWord(alternative)) ?? ""
         let fullAltKnown = models[currentLang.other]?.score(fullAlt) != nil
 

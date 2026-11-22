@@ -4,7 +4,7 @@ Aplicación de barra de menús para teclados inglés y español. Reconoce palabr
 
 ## Descargar
 
-[KeySwitch ES 0.3.8 para macOS](https://github.com/dimyan-l/KeySwitch/releases/tag/es-v0.3.8)
+[KeySwitch ES 0.3.9 para macOS](https://github.com/dimyan-l/KeySwitch/releases/tag/es-v0.3.9)
 
 Descomprime el ZIP y mueve KeySwitchES.app a Aplicaciones. Activa un teclado inglés y uno español. Abre los ajustes de KeySwitch ES, concede Accesibilidad y Monitorización de entrada y vuelve a abrir la aplicación si macOS lo solicita.
 
