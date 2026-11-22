@@ -4,10 +4,9 @@ import Foundation
 /// Pure source identity tracking, independent of typing or the Text Input Sources API.
 struct InputSourceContext {
     private var sourceID: String?
-
-    /// Advance synchronously on success, before queued source notifications arrive.
-    mutating func recordSelection(_ id: String, succeeded: Bool) {
-        if succeeded { sourceID = id }
+    /// The engine records its own selection only after TIS reports that source as current.
+    mutating func recordSelection(_ id: String) {
+        sourceID = id
     }
 
     /// Returns whether engine context belongs to a genuinely different source.
@@ -24,13 +23,21 @@ struct Stroke: Equatable {
     let keyCode: UInt16
     let shift: Bool
     let caps: Bool
+    let keyboardType: UInt32?
+
+    init(keyCode: UInt16, shift: Bool, caps: Bool, keyboardType: UInt32? = nil) {
+        self.keyCode = keyCode
+        self.shift = shift
+        self.caps = caps
+        self.keyboardType = keyboardType
+    }
 }
 
 /// Wraps the Text Input Sources API: finding the EN/ES layouts, switching, and translating
-/// key codes into characters with the real installed layouts (Spanish, ABC, US…).
+/// key codes into characters with the real installed layouts (Español, Español ISO, Latinoamericano, ABC, US…).
 final class KeyboardLayouts {
     struct Source {
-        let ref: TISInputSource
+        let ref: TISInputSource?
         let id: String
         let lang: Lang?
         let layout: Data?
@@ -39,9 +46,24 @@ final class KeyboardLayouts {
     private(set) var preferred: [Lang: Source] = [:]
     private var reverseMaps: [String: [Character: Stroke]] = [:]
     private var inputSourceContext = InputSourceContext()
+    private let readSource: () -> Source
+    private let requestSource: (Source) -> Bool
+    private let translate: (Stroke, Data?) -> String
 
-    init() {
-        refresh()
+    init(sources: [Lang: Source]? = nil, readSource: (() -> Source)? = nil,
+         requestSource: ((Source) -> Bool)? = nil, translate: ((Stroke, Data?) -> String)? = nil) {
+        self.readSource = readSource ?? {
+            guard let ref = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
+                return Source(ref: nil, id: "?", lang: nil, layout: nil)
+            }
+            return Self.makeSource(ref)
+        }
+        self.requestSource = requestSource ?? { source in
+            guard let ref = source.ref else { return false }
+            return TISSelectInputSource(ref) == noErr
+        }
+        self.translate = translate ?? Self.translateKey
+        if let sources { preferred = sources } else { refresh() }
         _ = inputSourceContext.observe(current().id)
     }
 
@@ -70,28 +92,38 @@ final class KeyboardLayouts {
             }
             preferred[lang] = found[lang]
         }
+        reverseMaps.removeAll()
         // Also remember whatever is active right now.
         let cur = current()
         if let lang = cur.lang, cur.layout != nil { preferred[lang] = cur }
     }
 
     func current() -> Source {
-        Self.makeSource(TISCopyCurrentKeyboardInputSource().takeRetainedValue())
+        readSource()
     }
 
     var currentLang: Lang? { current().lang }
 
     var hasBothLayouts: Bool { preferred[.es] != nil && preferred[.en] != nil }
 
-    func select(_ lang: Lang) {
-        guard let src = preferred[lang] else { return }
-        let status = TISSelectInputSource(src.ref)
-        inputSourceContext.recordSelection(src.id, succeeded: status == noErr)
+    /// Issue one request. Reissuing it later can override a deliberate Fn/Globe switch.
+    @discardableResult
+    func select(_ lang: Lang) -> Bool {
+        guard let source = preferred[lang] else { return false }
+        return current().id == source.id || requestSource(source)
+    }
+
+    func confirmSelection(_ id: String) {
+        inputSourceContext.recordSelection(id)
     }
 
     // MARK: - Translation
 
     func character(_ s: Stroke, layout: Data?) -> String {
+        translate(s, layout)
+    }
+
+    private static func translateKey(_ s: Stroke, layout: Data?) -> String {
         guard let layout else { return "" }
         var deadKeyState: UInt32 = 0
         var length = 0
@@ -107,7 +139,7 @@ final class KeyboardLayouts {
                 s.keyCode,
                 UInt16(kUCKeyActionDown),
                 mods,
-                UInt32(LMGetKbdType()),
+                s.keyboardType ?? UInt32(LMGetKbdType()),
                 OptionBits(1 << kUCKeyTranslateNoDeadKeysBit),
                 &deadKeyState,
                 maxLength,
@@ -131,8 +163,8 @@ final class KeyboardLayouts {
         string(strokes, layout: preferred[lang]?.layout)
     }
 
-    /// Re-read the selected text using the other physical keyboard layout.
-    /// EN and ES share an alphabet, so the active source determines direction.
+    /// Re-read physical keys in the other layout. English and Spanish share their alphabet,
+    /// so manual conversion uses the active layout or an explicit source language.
     func flipText(_ text: String, from: Lang) -> String {
         let to = from.other
         guard let fromSrc = preferred[from], let toSrc = preferred[to] else { return text }
@@ -147,6 +179,16 @@ final class KeyboardLayouts {
             }
         }
         return out
+    }
+
+    /// Punctuation in the active layout that corresponds to a letter in the other layout.
+    var letterPunctuation: Set<Character> {
+        guard let from = currentLang, let source = preferred[from], let target = preferred[from.other] else { return [] }
+        return Set(reverseMap(for: source).compactMap { character, stroke in
+            guard !character.isLetter, character.isPunctuation,
+                  self.character(stroke, layout: target.layout).first?.isLetter == true else { return nil }
+            return character
+        })
     }
 
     private func reverseMap(for src: Source) -> [Character: Stroke] {
@@ -166,17 +208,13 @@ final class KeyboardLayouts {
 
     // MARK: - TIS helpers
 
-    private static func makeSource(_ ref: TISInputSource) -> Source {
+    static func makeSource(_ ref: TISInputSource) -> Source {
         let id = string(ref, kTISPropertyInputSourceID) ?? "?"
         var lang: Lang?
         if let langs = property(ref, kTISPropertyInputSourceLanguages) as? [String], let first = langs.first {
             if first.hasPrefix("es") { lang = .es } else if first.hasPrefix("en") { lang = .en }
         }
-        var data: Data?
-        if let obj = property(ref, kTISPropertyUnicodeKeyLayoutData) {
-            let cf = unsafeBitCast(obj, to: CFData.self)
-            data = cf as Data
-        }
+        let data = property(ref, kTISPropertyUnicodeKeyLayoutData) as? Data
         return Source(ref: ref, id: id, lang: lang, layout: data)
     }
 
