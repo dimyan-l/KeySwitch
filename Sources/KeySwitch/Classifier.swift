@@ -7,8 +7,7 @@ enum Lang: String, CaseIterable, Codable {
     var label: String { self == .ru ? "RU" : "EN" }
 }
 
-/// Thresholds calibrated on frequency lists (see proto/classifier.py):
-/// ~0.0–0.2% false conversions, 92–99% of wrong-layout words fixed.
+/// Thresholds calibrated on frequency lists (see tools/classifier.py).
 enum Thresholds {
     static let freqMargin: Float = 2.0      // both readings are real words: other must be 100x more frequent
     static let ngramMargin: Float = 0.6     // neither reading is in a dictionary: avg log-prob gap per char
@@ -19,7 +18,7 @@ enum Thresholds {
 }
 
 func normalizeWord(_ s: String) -> String {
-    s.lowercased().replacingOccurrences(of: "ё", with: "е")
+    s.lowercased().precomposedStringWithCanonicalMapping.replacingOccurrences(of: "ё", with: "е")
 }
 
 /// Dictionary + character trigram model for one language.
@@ -120,13 +119,29 @@ final class LanguageModel {
 struct Decision {
     let convert: Bool
     let reason: String
+    let confident: Bool
+
+    init(convert: Bool, reason: String, confident: Bool = true) {
+        self.convert = convert
+        self.reason = reason
+        self.confident = confident
+    }
 }
 
 struct CorrectionPlan {
+    let prefix: String
     let currentWord: String
     let alternativeWord: String
     let suffix: String
     let decision: Decision
+
+    init(prefix: String = "", currentWord: String, alternativeWord: String, suffix: String, decision: Decision) {
+        self.prefix = prefix
+        self.currentWord = currentWord
+        self.alternativeWord = alternativeWord
+        self.suffix = suffix
+        self.decision = decision
+    }
 }
 
 final class Classifier {
@@ -155,6 +170,13 @@ final class Classifier {
         models[lang]?.add(word, score: Thresholds.learnedScore)
     }
 
+    func spellingInOtherLayout(current: String, alternative: String, currentLang: Lang) -> String? {
+        guard let source = models[currentLang], let target = models[currentLang.other],
+              source.score(source.core(normalizeWord(current))) == nil,
+              target.score(target.core(normalizeWord(alternative))) == nil else { return nil }
+        return SpellCorrector.correction(for: alternative, alternative: current, model: target, other: source)
+    }
+
     /// `current`: the word as the active layout produced it. `alternative`: same keys in the other layout.
     func decide(current: String, alternative: String, currentLang: Lang, contextLang: Lang? = nil) -> Decision {
         guard let cur = models[currentLang], let oth = models[currentLang.other] else {
@@ -170,8 +192,13 @@ final class Classifier {
 
         var freqMargin = Thresholds.freqMargin
         var ngramMargin = Thresholds.ngramMargin
-        if contextLang == oth.lang { freqMargin -= 1.0; ngramMargin -= 0.2 }
+        if contextLang == oth.lang {
+            freqMargin = max(0.8, freqMargin - 0.8)
+            ngramMargin = max(0.25, ngramMargin - 0.25)
+        }
 
+        let curNormalized = normalizeWord(current)
+        let curRawOK = cur.isWord(curNormalized)
         let curOK = cur.isWord(wc)
         let sc = curOK ? cur.score(wc) : nil
         let so = oth.score(wo)
@@ -180,12 +207,13 @@ final class Classifier {
         case (.some, .none):
             return Decision(convert: false, reason: "cur-dict")
         case (.none, .some):
-            if wo.count == 1 && contextLang != oth.lang {
+            if wo.count == 1 {
                 return Decision(convert: false, reason: "single-letter")
             }
             return Decision(convert: true, reason: "other-dict")
         case let (.some(c), .some(o)):
-            return Decision(convert: o - c >= freqMargin, reason: o - c >= freqMargin ? "freq" : "both-dict")
+            let favorsOther = o - c >= freqMargin
+            return Decision(convert: favorsOther, reason: favorsOther ? "freq" : "both-dict", confident: false)
         case (.none, .none):
             guard wo.count >= Thresholds.minNgramLength else {
                 return Decision(convert: false, reason: "short")
@@ -194,52 +222,115 @@ final class Classifier {
             let ngc: Float = curOK ? cur.ngramScore(wc) : -9
             let gap = ngo - ngc
             if ngo > Thresholds.ngramFloor && gap >= ngramMargin {
-                return Decision(convert: true, reason: "ngram")
+                let confident = !curOK
+                    || (!curRawOK && ngo > -2.0 && wo.count >= 4)
+                    || (wo.count >= 5 && ngo >= -1.8 && gap >= 0.75)
+                    || (wo.count >= 4 && ngo >= -2.2 && gap >= 0.9)
+                return Decision(convert: true, reason: "ngram", confident: confident)
+            }
+            // When leading/trailing layout-letter punctuation (e.g. '[' -> 'х' in "[jnabrc") makes the
+            // raw token invalid in the current layout, a solid n-gram lead over the stripped core suffices.
+            if !curRawOK, curOK, ngo > -2.0, gap >= 0.35, wo.count >= 4 {
+                return Decision(convert: true, reason: "ngram", confident: true)
             }
             return Decision(convert: false, reason: "ngram-no")
         }
     }
 
-    /// A punctuation key can be a letter in the other layout ('.' -> 'ю').
-    /// At a word boundary, keep a trailing punctuation run when the preceding
-    /// reading is a known correction and the full alternative is not a word.
-    func plan(current: String, alternative: String, currentLang: Lang) -> CorrectionPlan {
-        let full = decide(current: current, alternative: alternative, currentLang: currentLang)
+    /// A punctuation key can be a letter in the other layout ('.' -> 'ю', '"' -> 'Э').
+    /// At a word boundary, keep leading/trailing punctuation runs when the inner
+    /// reading is a clear correction and the full alternative is not a known word.
+    func plan(current: String, alternative: String, currentLang: Lang, contextLang: Lang? = nil) -> CorrectionPlan {
+        let full = decide(current: current, alternative: alternative, currentLang: currentLang, contextLang: contextLang)
         let currentChars = Array(current)
         let alternativeChars = Array(alternative)
         guard currentChars.count == alternativeChars.count else {
             return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
         }
-        var split = currentChars.count
-        while split > 0 {
-            let ch = currentChars[split - 1]
-            let alt = alternativeChars[split - 1]
+        let fullAlt = models[currentLang.other]?.core(normalizeWord(alternative)) ?? ""
+        let fullAltKnown = models[currentLang.other]?.score(fullAlt) != nil
+
+        var trail = currentChars.count
+        while trail > 0 {
+            let ch = currentChars[trail - 1]
+            let alt = alternativeChars[trail - 1]
             guard !ch.isLetter, !ch.isNumber, !ch.isWhitespace,
                   ch != "-", ch != "'", alt.isLetter else { break }
-            split -= 1
+            trail -= 1
         }
-        guard split > 0, split < currentChars.count else {
-            return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
+        var trailingPlan: CorrectionPlan?
+        if trail > 0, trail < currentChars.count, !fullAltKnown {
+            let prefixCur = String(currentChars[..<trail])
+            let prefixAlt = String(alternativeChars[..<trail])
+            let prefixDecision = decide(current: prefixCur, alternative: prefixAlt, currentLang: currentLang, contextLang: contextLang)
+            if prefixDecision.convert {
+                trailingPlan = CorrectionPlan(currentWord: prefixCur, alternativeWord: prefixAlt,
+                                              suffix: String(currentChars[trail...]), decision: prefixDecision)
+            }
         }
-        let prefix = String(currentChars[..<split])
-        let altPrefix = String(alternativeChars[..<split])
-        let prefixDecision = decide(current: prefix, alternative: altPrefix, currentLang: currentLang)
-        let fullAlt = models[currentLang.other]?.core(normalizeWord(alternative)) ?? ""
-        if prefixDecision.convert && models[currentLang.other]?.score(fullAlt) == nil {
-            return CorrectionPlan(currentWord: prefix, alternativeWord: altPrefix,
-                                  suffix: String(currentChars[split...]), decision: prefixDecision)
+
+        // Also unwrap leading (or surrounding) punctuation such as quotes/brackets ("ghbdtn", {ghbdtn})
+        // when the full reading isn't a known word in the target dictionary.
+        if (!full.convert || full.reason == "ngram"), !fullAltKnown {
+            var lead = 0
+            while lead < trail {
+                let ch = currentChars[lead]
+                let alt = alternativeChars[lead]
+                guard !ch.isLetter, !ch.isNumber, !ch.isWhitespace,
+                      ch != "-", ch != "'", alt.isLetter else { break }
+                lead += 1
+            }
+            if lead > 0, lead < trail {
+                let innerCur = String(currentChars[lead..<trail])
+                let innerAlt = String(alternativeChars[lead..<trail])
+                let innerDecision = decide(current: innerCur, alternative: innerAlt, currentLang: currentLang, contextLang: contextLang)
+                let beatsTrailing = trailingPlan == nil || (trailingPlan?.decision.reason == "ngram" && innerDecision.reason != "ngram")
+                let beatsFull = !full.convert || innerDecision.reason != "ngram"
+                if innerDecision.convert, innerDecision.confident, beatsTrailing, beatsFull {
+                    return CorrectionPlan(prefix: String(currentChars[..<lead]),
+                                          currentWord: innerCur, alternativeWord: innerAlt,
+                                          suffix: String(currentChars[trail...]), decision: innerDecision)
+                }
+            }
         }
+        if let trailingPlan { return trailingPlan }
         return CorrectionPlan(currentWord: current, alternativeWord: alternative, suffix: "", decision: full)
     }
 
-    /// A short previous word ("z" before "ghbdtn") is converted together with the next one
-    /// if its other reading is a real word and the typed reading is not (or much rarer).
+    /// True when an unconverted previous word clearly leans toward the other layout.
+    func leansTowardOther(current: String, alternative: String, currentLang: Lang) -> Bool {
+        guard let cur = models[currentLang], let oth = models[currentLang.other] else { return false }
+        let wc = cur.core(normalizeWord(current))
+        let wo = oth.core(normalizeWord(alternative))
+        guard oth.isWord(wo) else { return false }
+        let curOK = cur.isWord(wc)
+        let sc = curOK ? cur.score(wc) : nil
+        if let so = oth.score(wo) {
+            if let sc { return so - sc >= 1.0 }
+            return true
+        }
+        guard sc == nil, wo.count >= 3 else { return false }
+        let ngo = oth.ngramScore(wo)
+        let ngc: Float = curOK ? cur.ngramScore(wc) : -9
+        return ngo > -2.5 && ngo - ngc >= 0.4
+    }
+
+    /// A previous word ("z" before "ghbdtn", or an ambiguous/non-dict word) is converted
+    /// together with the next one if its other reading is clearly better than the typed one.
     func shouldRetroFix(current: String, alternative: String, currentLang: Lang) -> Bool {
         guard let cur = models[currentLang], let oth = models[currentLang.other] else { return false }
         let wc = cur.core(normalizeWord(current))
         let wo = oth.core(normalizeWord(alternative))
-        guard oth.isWord(wo), let so = oth.score(wo) else { return false }
-        if let sc = cur.isWord(wc) ? cur.score(wc) : nil { return so - sc >= 1.0 }
-        return true
+        guard oth.isWord(wo) else { return false }
+        let curOK = cur.isWord(wc)
+        let sc = curOK ? cur.score(wc) : nil
+        if let so = oth.score(wo) {
+            if let sc { return so - sc >= 0.8 }
+            return true
+        }
+        guard sc == nil, wo.count >= 3 else { return false }
+        let ngo = oth.ngramScore(wo)
+        let ngc: Float = curOK ? cur.ngramScore(wc) : -9
+        return ngo > -2.5 && ngo - ngc >= 0.35
     }
 }

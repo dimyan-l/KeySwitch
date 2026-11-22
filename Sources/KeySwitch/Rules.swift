@@ -3,22 +3,6 @@ import Foundation
 /// What kind of automatic change a correction was.
 enum FixKind: String, Codable, CaseIterable {
     case layout, spell, caseFix
-
-    var title: String {
-        switch self {
-        case .layout: "Раскладка"
-        case .spell: "Опечатка"
-        case .caseFix: "Регистр"
-        }
-    }
-    /// Plural, for the "type" column of the rules list.
-    var scopeTitle: String {
-        switch self {
-        case .layout: "Раскладка"
-        case .spell: "Опечатки"
-        case .caseFix: "Регистр"
-        }
-    }
 }
 
 /// How a rule came to be. Shown in Dictionaries → "Не исправлять".
@@ -27,15 +11,6 @@ enum RuleSource: String, Codable {
     case restore        // you put your own word back yourself (Backspace, selection, edit inside, ⌘Z)
     case manual         // "Не исправлять «…»" in the panel or added in Settings
     case migrated       // a word learned by an earlier version
-
-    var title: String {
-        switch self {
-        case .undo: "После отмены"
-        case .restore: "Ручное восстановление"
-        case .manual: "Добавлено вручную"
-        case .migrated: "Выучено раньше"
-        }
-    }
 }
 
 /// Your explicit decision, checked before the layout classifier, typo and case fixes.
@@ -57,8 +32,6 @@ struct UserRule: Codable, Hashable, Identifiable {
     static func key(_ word: String, _ lang: Lang, _ kind: FixKind?) -> String {
         "\(lang.rawValue)|\(kind?.rawValue ?? "all")|\(word)"
     }
-
-    var scopeTitle: String { kind?.scopeTitle ?? "Все исправления" }
 }
 
 /// Rules in memory. Owned by `UserStore`, read on the main thread by the keyboard handler: no disk access here.
@@ -82,12 +55,6 @@ struct RuleBook {
         return false
     }
 
-    /// A layout rule protects a word that starts this way: no switching mid-word on it.
-    func protectsPrefix(_ prefix: String, lang: Lang) -> Bool {
-        let p = normalizeWord(prefix)
-        return byKey.values.contains { !$0.deleted && $0.lang == lang && ($0.kind == nil || $0.kind == .layout) && $0.word.hasPrefix(p) }
-    }
-
     mutating func add(_ word: String, lang: Lang, kind: FixKind?, result: String?, source: RuleSource) -> UserRule {
         let r = UserRule(word: normalizeWord(word), lang: lang, kind: kind, result: result.map(normalizeWord),
                          source: source, modified: Date())
@@ -109,11 +76,5 @@ struct RuleBook {
             if have.modified == r.modified, have.deleted || !r.deleted { return }
         }
         byKey[r.id] = r
-    }
-
-    func merged(with other: RuleBook) -> RuleBook {
-        var out = self
-        for r in other.byKey.values { out.merge(r) }
-        return out
     }
 }

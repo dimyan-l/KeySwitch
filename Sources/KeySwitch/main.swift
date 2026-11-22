@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import ServiceManagement
 
 // Read-only permission check; does not create an event tap or request access.
@@ -37,8 +38,29 @@ if CommandLine.arguments.contains("--selftest") {
     exit(SelfTest.run() ? 0 : 1)
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+func runKeySwitch() {
+    // Hold one advisory lock for the entire menu-bar process, including startup.
+    let lockURL = FileManager.default.temporaryDirectory.appendingPathComponent("com.levantovsky.keyswitch.instance")
+    let fd = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+    guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        if fd >= 0 { close(fd) }
+        fputs("KeySwitch уже запущен или блокировка экземпляра недоступна.\n", stderr)
+        exit(75)
+    }
+    defer { close(fd) }
+
+    let app = NSApplication.shared
+    if let id = Bundle.main.bundleIdentifier,
+       NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: {
+           $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated
+       }) {
+        fputs("Другая копия KeySwitch уже запущена.\n", stderr)
+        exit(75)
+    }
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    withExtendedLifetime(delegate) { app.run() }
+}
+
+runKeySwitch()
