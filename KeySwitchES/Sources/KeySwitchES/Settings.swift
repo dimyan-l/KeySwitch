@@ -1,6 +1,20 @@
 import Foundation
 import CoreFoundation
 
+enum ApplicationCorrectionMode: String, CaseIterable {
+    case inherit, automatic, confirm, manual, off
+
+    var allowsAutomatic: Bool { self != .manual && self != .off }
+
+    func isCautious(defaultValue: Bool) -> Bool {
+        switch self {
+        case .automatic: return false
+        case .confirm: return true
+        default: return defaultValue
+        }
+    }
+}
+
 final class Settings {
     static let shared = Settings()
     private let d: UserDefaults
@@ -56,14 +70,27 @@ final class Settings {
         set { d.set(newValue, forKey: "excluded") }
     }
     func isExcluded(_ bundleID: String?) -> Bool {
-        guard let b = bundleID else { return false }
-        if b == Bundle.main.bundleIdentifier { return true }
-        return excluded.contains(b) || b.hasPrefix("com.jetbrains.")
+        applicationMode(for: bundleID) == .off
     }
-    func toggleExcluded(_ bundleID: String) {
-        var e = excluded
-        if let i = e.firstIndex(of: bundleID) { e.remove(at: i) } else { e.append(bundleID) }
-        excluded = e
+
+    var applicationModes: [String: ApplicationCorrectionMode] {
+        (d.dictionary(forKey: "applicationCorrectionModes") ?? [:]).compactMapValues {
+            ($0 as? String).flatMap(ApplicationCorrectionMode.init(rawValue:))
+        }
+    }
+
+    func applicationMode(for bundleID: String?) -> ApplicationCorrectionMode {
+        guard let bundleID else { return .inherit }
+        if bundleID == Bundle.main.bundleIdentifier { return .off }
+        if let raw = d.dictionary(forKey: "applicationCorrectionModes")?[bundleID] as? String,
+           let mode = ApplicationCorrectionMode(rawValue: raw), mode != .inherit { return mode }
+        return excluded.contains(bundleID) || bundleID.hasPrefix("com.jetbrains.") ? .off : .inherit
+    }
+
+    func setApplicationMode(_ mode: ApplicationCorrectionMode, for bundleID: String) {
+        var modes = d.dictionary(forKey: "applicationCorrectionModes") ?? [:]
+        modes[bundleID] = mode == .inherit ? nil : mode.rawValue
+        d.set(modes, forKey: "applicationCorrectionModes")
     }
 
 }
@@ -211,11 +238,6 @@ final class UserStore {
         save()
     }
 
-    func forgetAllLearned() {
-        payload.learned = [:]
-        save()
-    }
-
     private func save() {
         guard canSave else { return }
         payload.rules = rules.all
@@ -262,14 +284,14 @@ final class UserStore {
         }
     }
 
-    /// Creates editable my_en.txt / my_es.txt on first launch.
+    /// Creates editable my_es.txt / my_en.txt on first launch.
     private func seedCustomLists() {
         for l in Lang.allCases {
             let f = directory.appendingPathComponent("my_\(l.rawValue).txt")
             if !FileManager.default.fileExists(atPath: f.path) {
-                let header = l == .en
-                    ? "# English words: names, products, jargon. Reload dictionaries after editing.\n"
-                    : "# Palabras en español: nombres y términos propios. Recarga los diccionarios al editar.\n"
+                let header = l == .es
+                    ? "# Palabras en español: nombres y términos propios. Reinicia KeySwitch ES después de editar.\n"
+                    : "# My English words: names, products, jargon. After editing: menu → Reload dictionaries.\n"
                 try? header.write(to: f, atomically: true, encoding: .utf8)
             }
         }

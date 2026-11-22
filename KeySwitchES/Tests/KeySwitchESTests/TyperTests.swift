@@ -16,9 +16,7 @@ final class TyperTests: XCTestCase {
             var posted: [CGEvent] = []
             let typer = Typer(queue: queue, eventSink: { posted.append($0.copy()!) })
             let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
-            let stroke = Stroke(keyCode: 0, shift: false, caps: false)
-            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b", strokes: [stroke],
-                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b", language: .en))
             let up = CGEvent(keyboardEventSource: nil, virtualKey: 49, keyDown: false)!
             XCTAssertNil(engine.handle(type: .keyUp, event: up))
             if let code = releaseCode {
@@ -56,9 +54,7 @@ final class TyperTests: XCTestCase {
             queue.suspend()
             let typer = Typer(queue: queue, eventSink: { _ in })
             let engine = SwitchEngine(layouts: KeyboardLayouts(), store: makeStore(), typer: typer, frontmostPID: { 123 })
-            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b",
-                strokes: [Stroke(keyCode: 0, shift: false, caps: false)],
-                terminator: Stroke(keyCode: 49, shift: false, caps: false), isKey: true, language: .en, isEnter: false))
+            XCTAssertTrue(engine.applySpellingCorrection(original: "a", replacement: "b", language: .en))
             let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)!
             if code == 57 { event.type = .flagsChanged; event.flags = .maskAlphaShift }
             XCTAssertNil(engine.handle(type: event.type, event: event))

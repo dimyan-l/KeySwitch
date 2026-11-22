@@ -34,7 +34,7 @@ enum SelfTest {
         var passed = 0
         for (current, alternative, lang, expected) in cases {
             let plan = classifier.plan(current: current, alternative: alternative, currentLang: lang)
-            let got = plan.decision.convert ? plan.alternativeWord + plan.suffix : nil
+            let got = plan.decision.convert && plan.decision.confident ? plan.prefix + plan.alternativeWord + plan.suffix : nil
             if got == expected { passed += 1 }
             print("\(got == expected ? "✓" : "✗") \(lang.label) \(current) → \(got ?? "unchanged") [\(plan.decision.reason)]")
         }

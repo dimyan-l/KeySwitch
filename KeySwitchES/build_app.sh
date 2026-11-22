@@ -22,7 +22,7 @@ if [[ "${1:-}" == "--install" ]]; then
   done
 fi
 
-echo "→ Компилирую (release)…"
+echo "→ Compilando (release)…"
 swift build -c release
 
 APP="build/KeySwitchES.app"
@@ -38,9 +38,9 @@ cp DICTIONARY_LICENSE.md "$APP/Contents/Resources/DICTIONARY_LICENSE.md"
 # Una firma estable conserva los permisos entre versiones. El archivo de
 # distribución puede llevar una firma ad-hoc hasta que su dueño lo firme.
 codesign --force --deep --sign "$IDENTITY" "$APP"
-echo "→ Подписано: $IDENTITY"
+echo "→ Firmado: $IDENTITY"
 
-echo "→ Самопроверка словарей:"
+echo "→ Comprobación de diccionarios:"
 "$APP/Contents/MacOS/KeySwitchES" --selftest | tail -4
 
 if [[ "${1:-}" == "--install" ]]; then

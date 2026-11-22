@@ -1,13 +1,19 @@
 # KeySwitch ES — cambio automático de teclado EN/ES para macOS
 
-Aplicación de barra de menús para teclados inglés y español. Reconoce palabras al terminar de escribirlas, cambia el teclado para el siguiente texto y corrige caracteres que salen distintos entre ambos teclados. Funciona sin servicios de IA ni red.
+Aplicación de barra de menús para teclados inglés y español. Reconoce palabras al pulsar espacio, cambia el teclado para el siguiente texto y corrige caracteres que salen distintos entre ambos teclados. Funciona sin servicios de IA ni red.
+
+## Descargar
+
+[KeySwitch ES 0.3.8 para macOS](https://github.com/dimyan-l/KeySwitch/releases/tag/es-v0.3.8)
+
+Descomprime el ZIP y mueve KeySwitchES.app a Aplicaciones. Activa un teclado inglés y uno español. Abre los ajustes de KeySwitch ES, concede Accesibilidad y Monitorización de entrada y vuelve a abrir la aplicación si macOS lo solicita.
 
 ## Cómo funciona
 
 - Tras `hola`, `gracias` o `casa` escritos con el teclado inglés, cambia al español. Tras `hello`, `thanks` o `the` con el teclado español, cambia al inglés.
 - Las letras A–Z están en las mismas teclas en los dos diseños QWERTY. Por eso, cambiar de idioma normalmente **no reescribe** la palabra: cambia el teclado para la puntuación, `ñ` y los acentos que escribas después.
 - Si una tecla sí produjo otro carácter, por ejemplo `ni;o` con teclado inglés en vez de `niño` con teclado español, puede reescribir la palabra.
-- Las erratas claras (`gracais` → `gracias`, `recieve` → `receive`) se corrigen al terminar la palabra. Puedes desactivar esta función en Ajustes → Correcciones.
+- Activa «Corregir erratas» en Ajustes → Correcciones para corregir casos claros como `gracais` → `gracias` y `recieve` → `receive` al pulsar espacio.
 - Si un término es frecuente en ambos idiomas, conserva el teclado actual. Los nombres propios y las palabras desconocidas se pueden añadir a `my_en.txt` o `my_es.txt`.
 - Los acentos compuestos con teclas muertas se conservan como se escribieron; la conversión automática de sus secuencias depende del diseño de teclado instalado.
 
@@ -19,20 +25,20 @@ Aplicación de barra de menús para teclados inglés y español. Reconoce palabr
 | Convertir texto seleccionado con el otro teclado | ⌃⌥R |
 | Corregir una palabra ya escrita o cambiar mayúsculas | Seleccionar una palabra con el ratón o Mayús+flecha y elegir una opción en la ventana flotante |
 | Historial del portapapeles (30 textos, frases fijadas) | ⌃⌥V |
-| Desactivar la corrección en una aplicación | Menú → «No corregir en…» |
+| Cambiar o pausar la corrección en una aplicación | Menú → «Modo en…» |
 | Añadir términos propios | Ajustes → Diccionarios → Mis palabras |
 | Añadir o quitar excepciones para teclado y erratas | Ajustes → Diccionarios → Excepciones |
 
 Los terminales, IDE y gestores de contraseñas están excluidos por defecto. El historial del portapapeles permanece en memoria; los textos fijados se guardan en `~/Library/Application Support/KeySwitchES/`.
 La ventana de sugerencias solo aparece al seleccionar una palabra y no cambia nada hasta que elijas una opción. Puedes desactivarla en Ajustes → Correcciones.
 
-El **modo prudente** está activado por defecto: una sugerencia basada solo en estadísticas se indica en naranja y se aplica únicamente con ⌥ derecho. No se modifican automáticamente las direcciones, identificadores con `_`, palabras con números ni nombres con un punto interior. Tab no activa una corrección, para no modificar el siguiente campo. La reescritura automática se limita a 24 caracteres.
+El **modo prudente** está activado por defecto: una sugerencia basada solo en estadísticas se indica en naranja y se aplica únicamente con ⌥ derecho. Se protegen las direcciones, los identificadores con `_`, palabras con números y tokens con puntos internos. Si cambias de teclado a mitad de palabra, KeySwitch ES espera el siguiente espacio para empezar a comprobar de nuevo. Tab e Intro dejan que la aplicación de destino reciba la tecla. La reescritura automática se limita a 24 caracteres.
 
-La instalación nueva incluye seis excepciones inglesas importadas de KeySwitch 0.3.2. No había excepciones españolas en esa base; puedes añadirlas desde Ajustes → Diccionarios. Las erratas inglesas y españolas se corrigen con los diccionarios locales. Si borras una excepción, no reaparece al reiniciar.
+La instalación nueva incluye excepciones inglesas importadas de KeySwitch 0.3.2. No había excepciones españolas en esa base; puedes añadirlas desde Ajustes → Diccionarios. Las erratas inglesas y españolas se corrigen con los diccionarios locales. Si borras una excepción, no reaparece al reiniciar.
 
-## Diseño de movimiento: «Dial»
+## Apariencia
 
-El indicador compacto EN/ES utiliza el color de acento del sistema y una transición de 160 ms. Un breve halo confirma las correcciones; Ⅱ indica una pausa. Las animaciones se desactivan con Reducir movimiento en macOS.
+KeySwitch ES comparte los ajustes en tonos pastel y el indicador de barra de menús de KeySwitch 0.3.8. El indicador muestra EN o ES y Ⅱ durante una pausa. Las animaciones respetan la opción Reducir movimiento de macOS.
 
 ## Compilar e instalar
 
@@ -62,8 +68,17 @@ Las compilaciones sin un certificado de firma estable usan una firma temporal; m
 
 La clasificación se realiza al finalizar una palabra. La selección de texto presupone que el teclado activo es el diseño con el que se escribió. El comportamiento de caracteres especiales varía entre Español, Español ISO, Español Latinoamericano y diseños de terceros; KeySwitch ES usa las tablas reales de los teclados activos de macOS.
 
-La captura de teclas se puede pausar desde el menú. Si macOS la detiene por un tiempo de espera, KeySwitch ES deja pasar la entrada y espera a que la reactives manualmente. Para desactivar el inicio automático sin abrir la aplicación: `KeySwitchES.app/Contents/MacOS/KeySwitchES --disable-login`.
+Puedes pausar la captura desde el menú. Tras varios tiempos de espera seguidos, usa «Reanudar KeySwitch ES» para volver a activarla. Para desactivar el inicio automático sin abrir la aplicación: `KeySwitchES.app/Contents/MacOS/KeySwitchES --disable-login`.
 
-### Ajustes y apariencia
+### Ajustes y diagnóstico
 
 «Ajustes…» abre una ventana con correcciones, diccionarios, aplicaciones excluidas y atajos. Los diccionarios permiten buscar, añadir, eliminar y deshacer el último cambio. Los últimos 50 cambios se conservan solo durante la sesión. En las sugerencias, las flechas eligen, Enter aplica y Esc cierra. El indicador compacto muestra Ⅱ cuando está en pausa.
+
+Para recibir contadores y tiempos sin registrar el texto ni las pulsaciones, abre KeySwitch ES con `--diagnostics`. El argumento `--backspace-undo` habilita el deshacer inmediato con Retroceso cuando Accesibilidad puede verificar el texto junto al cursor. Cierra KeySwitch ES antes de abrirla con esos argumentos.
+
+```bash
+open -a /Applications/KeySwitchES.app --args --diagnostics --backspace-undo
+log stream --predicate 'subsystem == "com.levantovsky.keyswitches"'
+```
+
+Si tienes instalada la edición RU/EN, pausa una edición antes de usar la otra.
