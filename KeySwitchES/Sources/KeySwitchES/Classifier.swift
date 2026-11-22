@@ -119,13 +119,29 @@ final class LanguageModel {
 struct Decision {
     let convert: Bool
     let reason: String
+    let confident: Bool
+
+    init(convert: Bool, reason: String, confident: Bool = true) {
+        self.convert = convert
+        self.reason = reason
+        self.confident = confident
+    }
 }
 
 struct CorrectionPlan {
+    let prefix: String
     let currentWord: String
     let alternativeWord: String
     let suffix: String
     let decision: Decision
+
+    init(prefix: String = "", currentWord: String, alternativeWord: String, suffix: String, decision: Decision) {
+        self.prefix = prefix
+        self.currentWord = currentWord
+        self.alternativeWord = alternativeWord
+        self.suffix = suffix
+        self.decision = decision
+    }
 }
 
 final class Classifier {
