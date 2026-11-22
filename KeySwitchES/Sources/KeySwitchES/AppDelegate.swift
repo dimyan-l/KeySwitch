@@ -53,7 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return false }
             return self?.selectionPanel.handleKey(code) ?? false
         }
-        statusItem = NSStatusBar.system.statusItem(withLength: 56)
+        statusItem = NSStatusBar.system.statusItem(withLength: 66)
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -243,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep the local animated layout badge; the lock is a separate title, not a replacement image.
         button.title = secureInputState.isEnabled ? "🔒" : ""
         button.imagePosition = secureInputState.isEnabled ? .imageLeading : .imageOnly
-        statusItem.length = secureInputState.isEnabled ? 76 : 56
+        statusItem.length = secureInputState.isEnabled ? 86 : 66
         button.toolTip = secureInputState.isEnabled ? secureInputExplanation : nil
         button.setAccessibilityHelp(button.toolTip)
         button.alphaValue = 1

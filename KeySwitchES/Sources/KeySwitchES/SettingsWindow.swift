@@ -20,6 +20,7 @@ final class PreferencesModel: ObservableObject {
     @Published var message = ""
     @Published var history: [CorrectionEntry] = []
     @Published var undoAvailable = false
+    @Published var page = 0
     private var undoAction: (() -> Void)?
 
     init(store: UserStore) { self.store = store }
@@ -87,13 +88,13 @@ final class PreferencesModel: ObservableObject {
 
 final class PreferencesWindowController: NSWindowController {
     let model: PreferencesModel
-    init(store: UserStore) {
+    init(store: UserStore, applicationProfiles: ((PreferencesModel) -> AnyView)? = nil) {
         model = PreferencesModel(store: store)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 580),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 640),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = ui("Настройки KeySwitch", "Ajustes de KeySwitch ES")
-        window.minSize = NSSize(width: 760, height: 540)
-        window.contentView = NSHostingView(rootView: PreferencesView(model: model))
+        window.minSize = NSSize(width: 770, height: 540)
+        window.contentView = NSHostingView(rootView: PreferencesView(model: model, applicationProfiles: applicationProfiles))
         window.isReleasedWhenClosed = false
         window.setFrameAutosaveName("KeySwitchPreferences")
         super.init(window: window)
@@ -106,87 +107,163 @@ final class PreferencesWindowController: NSWindowController {
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
     }
+    func presentHelp() {
+        model.message = ""
+        model.page = 4
+        present()
+    }
 }
 
 private struct PreferencesView: View {
     @ObservedObject var model: PreferencesModel
-    @State private var page = 0
+    let applicationProfiles: ((PreferencesModel) -> AnyView)?
     @State private var list = 0
     @State private var query = ""
     @State private var word = ""
     @State private var language = Lang.allCases[0]
     @State private var scope = 0
-    private let titles = [ui("Исправления", "Correcciones"), ui("Словари", "Diccionarios"), ui("Приложения", "Aplicaciones"), ui("Клавиши", "Atajos")]
-    private let symbols = ["switch.2", "character.book.closed", "app.badge", "keyboard"]
+    private let titles = [ui("Исправления", "Correcciones"), ui("Словари", "Diccionarios"), ui("Приложения", "Aplicaciones"), ui("Клавиши", "Atajos"), ui("Как пользоваться", "Guía rápida")]
+    private let symbols = ["switch.2", "character.book.closed", "app.badge", "keyboard", "questionmark.circle"]
+    private var page: Int { model.page }
+
+    private var appVersion: String? {
+        guard let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else { return nil }
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        return build.map { "v\(short) (\($0))" } ?? "v\(short)"
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var palette: ClayPalette { ClayPalette(dark: colorScheme == .dark) }
 
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                Label("KeySwitch", systemImage: "keyboard.badge.ellipsis").font(.title3.weight(.semibold)).padding(.bottom, 20)
+                HStack(spacing: 9) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable().interpolation(.high).frame(width: 34, height: 34)
+                        .accessibilityHidden(true)
+                    Text("KeySwitch").font(.system(size: 18, weight: .bold, design: .rounded))
+                }
+                .padding(.bottom, 24)
                 ForEach(0..<titles.count, id: \.self) { index in
-                    Button { page = index; model.message = "" } label: {
-                        Label(titles[index], systemImage: symbols[index]).frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                            .background(page == index ? Color.accentColor.opacity(0.15) : .clear)
-                            .cornerRadius(8)
-                    }.buttonStyle(.plain).foregroundColor(page == index ? .accentColor : .primary)
+                    Button {
+                        model.page = index
+                        model.message = ""
+                    } label: {
+                        Label(titles[index], systemImage: symbols[index])
+                            .font(.system(size: 13, weight: page == index ? .semibold : .regular))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12).padding(.vertical, 10)
+                            .background {
+                                if page == index { ClaySurface(colors: palette.sage, radius: 13, dark: palette.dark) }
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(page == index ? .isSelected : [])
                 }
                 Spacer()
-                Text(spanishUI ? "EN / ES" : "EN / RU").font(.caption.monospaced()).foregroundStyle(.secondary)
-                Text(ui("Исправления без отвлечений", "Escribe sin interrupciones")).font(.caption).foregroundStyle(.secondary)
-            }.padding(20).frame(width: 190).background(.ultraThinMaterial)
-            Divider()
-            VStack(alignment: .leading, spacing: 18) {
-                Text(titles[page]).font(.largeTitle.weight(.semibold))
+                HStack(spacing: 8) {
+                    Text(spanishUI ? "EN / ES" : "EN / RU").font(.caption.weight(.semibold).monospaced())
+                    if let appVersion { Text(appVersion).font(.caption2.monospaced()).foregroundStyle(.secondary) }
+                }
+                .padding(.leading, 10)
+            }
+            .padding(20)
+            .frame(width: 214)
+            .background(LinearGradient(colors: palette.sidebar, startPoint: .topLeading, endPoint: .bottomTrailing))
+            VStack(alignment: .leading, spacing: 20) {
+                Text(titles[page]).font(.system(size: 32, weight: .bold, design: .rounded))
+                    .accessibilityAddTraits(.isHeader)
                 if page == 0 { corrections }
                 else if page == 1 { dictionaries }
-                else if page == 2 { applications }
-                else { shortcuts }
+                else if page == 2 {
+                    if let applicationProfiles { applicationProfiles(model) } else { applications }
+                } else if page == 3 { shortcuts }
+                else { help }
                 if !model.message.isEmpty { Text(model.message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled) }
-            }.padding(28).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        }.frame(minWidth: 760, minHeight: 540)
+            }
+            .padding(.horizontal, 26).padding(.vertical, 22)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(LinearGradient(colors: palette.canvas, startPoint: .topLeading, endPoint: .bottomTrailing))
+        }
+        .frame(minWidth: 770, minHeight: 540)
         .onChange(of: page) { _ in query = "" }
     }
+
     private var corrections: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 14) {
-                        Toggle(ui("Автоматически менять раскладку", "Cambiar teclado automáticamente"), isOn: model.flag(\.autoEnabled))
-                        Toggle(ui("Исправлять опечатки", "Corregir erratas"), isOn: model.flag(\.spellEnabled))
-                        Toggle(ui("Осторожный режим", "Modo prudente"), isOn: model.flag(\.cautiousMode))
-                        Text(ui("При неоднозначном результате исправление ждёт нажатия правого ⌥.", "Las correcciones ambiguas esperan a que pulses ⌥ derecho.")).font(.caption).foregroundStyle(.secondary)
-                        Divider()
-                        Toggle(ui("Варианты при выделении слова", "Sugerencias al seleccionar una palabra"), isOn: model.flag(\.selectionSuggestionsEnabled))
-                        Toggle(ui("Звук после исправления", "Sonido al corregir"), isOn: model.flag(\.sound))
-                        Divider()
-                        Toggle(ui("Сохранять историю буфера обмена", "Guardar historial del portapapeles"), isOn: model.flag(\.clipboardEnabled))
-                        Text(ui("История выключена по умолчанию. Закреплённые фразы доступны независимо от истории.", "El historial está desactivado por defecto. Las frases fijadas siguen disponibles independientemente del historial.")).font(.caption).foregroundStyle(.secondary)
-                        if !Settings.shared.clipboardEnabled {
-                            Text(ui("Новые копирования не добавляются в историю.", "Las nuevas copias no se añaden al historial.")).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }.padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(ui("Автосмена раскладки", "Cambio automático de teclado"))
+                            .font(.system(size: 22, weight: .bold, design: .rounded))
+                        Text(ui("Нажмите пробел после слова, чтобы KeySwitch проверил раскладку.",
+                                "Pulsa espacio después de una palabra para que KeySwitch compruebe el teclado."))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    Toggle("", isOn: model.flag(\.autoEnabled))
+                        .toggleStyle(ClayToggleStyle(palette: palette))
+                        .frame(width: 46)
+                        .accessibilityLabel(ui("Автосмена раскладки", "Cambio automático de teclado"))
+                }
+                .padding(18)
+                .background { ClaySurface(colors: palette.sage, radius: 21, dark: palette.dark) }
+
+                clayCard(ui("Правила исправления", "Reglas de corrección"), symbol: "text.badge.checkmark", colors: palette.blue) {
+                    Toggle(ui("Исправлять опечатки", "Corregir erratas"), isOn: model.flag(\.spellEnabled))
+                    Toggle(ui("Осторожный режим", "Modo prudente"), isOn: model.flag(\.cautiousMode))
+                    Text(ui("Сомнительный вариант можно применить правым Option.", "Pulsa Option derecho para aplicar una sugerencia dudosa."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle(ui("Варианты при выделении слова", "Sugerencias al seleccionar una palabra"), isOn: model.flag(\.selectionSuggestionsEnabled))
+                    Toggle(ui("Звук после исправления", "Sonido al corregir"), isOn: model.flag(\.sound))
+                }
+                clayCard(ui("Буфер обмена", "Portapapeles"), symbol: "clipboard", colors: palette.peach) {
+                    Toggle(ui("Хранить историю до выхода", "Guardar historial hasta salir"), isOn: model.flag(\.clipboardEnabled))
+                    Text(ui("Закреплённые фразы доступны в меню и после перезапуска.", "Las frases fijadas siguen disponibles después de reiniciar."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button(ui("Очистить историю", "Borrar historial")) {
+                        NotificationCenter.default.post(name: .keySwitchClearClipboard, object: nil)
+                    }
+                }
+                clayCard(ui("Доступ macOS", "Permisos de macOS"), symbol: "lock.shield", colors: palette.panel) {
+                    permission(ui("Универсальный доступ", "Accesibilidad"), granted: AXIsProcessTrusted(), anchor: "Privacy_Accessibility")
+                    permission(ui("Мониторинг ввода", "Monitorización de entrada"), granted: CGPreflightListenEventAccess(), anchor: "Privacy_ListenEvent")
+                    Button(ui("Проверить разрешения", "Comprobar permisos")) { model.refresh() }
                 }
                 Toggle(ui("Запускать при входе в систему", "Abrir al iniciar sesión"), isOn: Binding(get: {
-                    _ = model.revision; return SMAppService.mainApp.status == .enabled
+                    _ = model.revision
+                    return SMAppService.mainApp.status == .enabled
                 }, set: { enabled in
                     do {
                         if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
                     } catch { model.message = error.localizedDescription }
                     model.refresh()
                 }))
-                GroupBox(ui("Доступ macOS", "Permisos de macOS")) {
-                    VStack(spacing: 12) {
-                        permission(ui("Универсальный доступ", "Accesibilidad"), granted: AXIsProcessTrusted(), anchor: "Privacy_Accessibility")
-                        permission(ui("Мониторинг ввода", "Monitorización de entrada"), granted: CGPreflightListenEventAccess(), anchor: "Privacy_ListenEvent")
-                        Button(ui("Проверить разрешения", "Comprobar permisos")) { model.refresh() }.frame(maxWidth: .infinity, alignment: .trailing)
-                    }.padding(10)
-                }
-                Button(ui("Очистить историю буфера", "Borrar historial del portapapeles")) {
-                    NotificationCenter.default.post(name: .keySwitchClearClipboard, object: nil)
-                }
+                .padding(.vertical, 8)
             }
+            .toggleStyle(ClayToggleStyle(palette: palette))
+            .padding(3)
+            .padding(.bottom, 10)
         }
     }
+
+    private func clayCard<Content: View>(_ title: String, symbol: String, colors: [Color],
+                                         @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .accessibilityAddTraits(.isHeader)
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background { ClaySurface(colors: colors, radius: 19, dark: palette.dark) }
+    }
+
     private func permission(_ title: String, granted: Bool, anchor: String) -> some View {
         HStack {
             Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle").foregroundStyle(granted ? .green : .orange)
@@ -287,10 +364,97 @@ private struct PreferencesView: View {
             Spacer()
         }
     }
+    private var help: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 19) {
+                shortcut("Fn 🌐", ui("Сменить язык", "Cambiar de idioma"), ui("Нажмите Fn с глобусом, если в настройках клавиатуры macOS клавиша назначена на смену источника ввода.", "Pulsa Fn con el globo si macOS tiene asignada esa tecla para cambiar la fuente de entrada."))
+                shortcut("⌥", ui("Исправить или отменить", "Corregir o deshacer"), ui("Нажмите правый Option у слова. Сразу после автозамены он возвращает исходный текст.", "Pulsa Option derecho junto a una palabra. Tras una corrección automática, restaura el texto original."))
+                shortcut("⌃ ⌥ R", ui("Исправить фрагмент", "Corregir un fragmento"), ui("Выделите текст и нажмите сочетание, чтобы перечитать его в другой раскладке.", "Selecciona el texto y pulsa el atajo para convertirlo al otro teclado."))
+                shortcut(ui("Пробел", "Espacio"), ui("Автоисправление при наборе", "Corrección al escribir"), ui("Например, ghbdtn превращается в «привет». Опечатки можно включить отдельно в разделе «Исправления».", "Por ejemplo, ni;o se convierte en «niño». Activa las erratas en la sección Correcciones."))
+                if applicationProfiles != nil {
+                    shortcut(ui("Профили", "Perfiles"), ui("Выбрать режим для приложения", "Elegir un modo por aplicación"), ui("В разделе «Приложения» можно оставить только ручное исправление или запросить подтверждение сомнительных замен.", "En Aplicaciones puedes elegir el modo manual o confirmar los cambios dudosos."))
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
     private func shortcut(_ keys: String, _ title: String, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 18) {
-            Text(keys).font(.system(.callout, design: .monospaced).weight(.medium)).padding(8).frame(width: 125).background(.quaternary).cornerRadius(7)
+            Text(keys).font(.system(.callout, design: .monospaced).weight(.semibold))
+                .padding(8).frame(width: 125)
+                .background { ClaySurface(colors: palette.panel, radius: 10, dark: palette.dark) }
             VStack(alignment: .leading, spacing: 4) { Text(title).fontWeight(.medium); Text(detail).font(.callout).foregroundStyle(.secondary) }
+        }
+    }
+}
+
+private struct ClayPalette {
+    let dark: Bool
+
+    var canvas: [Color] { colors(0xFCF7EB, 0xF2E9D9, 0x272823, 0x1E2322) }
+    var sidebar: [Color] { colors(0xE5EDDC, 0xC7D9CA, 0x34453B, 0x24332F) }
+    var sage: [Color] { colors(0xE7F0DA, 0xBDD6BF, 0x415743, 0x304538) }
+    var blue: [Color] { colors(0xF1F7F8, 0xD4E6EE, 0x344650, 0x2B3B46) }
+    var peach: [Color] { colors(0xFCF1E9, 0xF1DECF, 0x493C35, 0x3B302D) }
+    var panel: [Color] { colors(0xFFFDF5, 0xF1E7D5, 0x3D3D34, 0x2E302B) }
+
+    private func colors(_ lightTop: UInt32, _ lightBottom: UInt32, _ darkTop: UInt32, _ darkBottom: UInt32) -> [Color] {
+        (dark ? [darkTop, darkBottom] : [lightTop, lightBottom]).map { hex in
+            Color(red: Double(hex >> 16) / 255, green: Double(hex >> 8 & 255) / 255, blue: Double(hex & 255) / 255)
+        }
+    }
+}
+
+private struct ClaySurface: View {
+    let colors: [Color]
+    let radius: CGFloat
+    let dark: Bool
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        shape
+            .fill(LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing))
+            .overlay {
+                shape.strokeBorder(
+                    LinearGradient(colors: [.white.opacity(dark ? 0.20 : 0.78), .clear, .black.opacity(0.10)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
+                    lineWidth: 1.5
+                )
+            }
+            .shadow(color: .black.opacity(dark ? 0.25 : 0.11), radius: 5, x: 0, y: 3)
+    }
+}
+
+private struct ClayToggleStyle: ToggleStyle {
+    let palette: ClayPalette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) { configuration.isOn.toggle() }
+        } label: {
+            HStack {
+                configuration.label
+                Spacer(minLength: 0)
+                Capsule()
+                    .fill(configuration.isOn ? Color(red: 0.29, green: 0.44, blue: 0.37) : .secondary.opacity(0.22))
+                    .overlay { Capsule().strokeBorder(.black.opacity(0.12), lineWidth: 1) }
+                    .overlay(alignment: configuration.isOn ? .trailing : .leading) {
+                        ClaySurface(colors: palette.panel, radius: 11, dark: palette.dark)
+                            .frame(width: 19, height: 19)
+                            .overlay {
+                                Image(systemName: configuration.isOn ? "checkmark" : "minus")
+                                    .font(.system(size: 8, weight: .bold))
+                            }
+                            .padding(3)
+                    }
+                    .frame(width: 46, height: 25)
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityRepresentation {
+            Toggle(isOn: configuration.$isOn) { configuration.label }.toggleStyle(.switch)
         }
     }
 }

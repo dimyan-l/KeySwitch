@@ -71,12 +71,14 @@ final class ClipboardHistory {
         }
         guard pb.changeCount != lastChange else { return }
         lastChange = pb.changeCount
-        guard Date() > suspendedUntil else { return }
+        guard Date() > suspendedUntil, !SecureInput.isEnabled else { return }
         if let source = foregroundBundleIdentifier()?.lowercased(),
            sensitiveApps.contains(source) { return }
         let types = Set((pb.types ?? []).map(\.rawValue))
+            .union((pb.pasteboardItems ?? []).flatMap { $0.types.map(\.rawValue) })
         guard types.isDisjoint(with: ignoredTypes) else { return }
-        guard let s = pb.string(forType: .string), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, s.count < 100_000 else { return }
+        guard let s = pb.string(forType: .string), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              s.count < 100_000, pb.changeCount == lastChange, !SecureInput.isEnabled else { return }
         add(s)
     }
 

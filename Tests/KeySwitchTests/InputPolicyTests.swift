@@ -35,14 +35,34 @@ final class InputPolicyTests: XCTestCase {
             XCTAssertTrue(plan.decision.convert)
             XCTAssertFalse(InputPolicy.blocksAutomaticCorrection(typed, plan: plan), typed)
         }
-        for typed in ["example.com", "object.method"] {
+        for typed in ["example.com", "object.method", "main.py", "app.swift"] {
             let plan = classifier.plan(current: typed, alternative: SelfTest.flip(typed, to: .ru), currentLang: .en)
             XCTAssertTrue(InputPolicy.blocksAutomaticCorrection(typed, plan: plan), typed)
         }
+        // Known word with trailing sentence punctuation and inflected Cyrillic words with 'ю' ('.')
+        for (typed, expected) in [
+            ("rjvgm.nth.", "компьютер."),
+            ("k.lb,", "люди,"),
+            ("gjlrk.xbkb", "подключили"),
+            ("gjlrk.xf.cm", "подключаюсь"),
+            ("rjvgm.nthf", "компьютера"),
+        ] {
+            let plan = classifier.plan(current: typed, alternative: SelfTest.flip(typed, to: .ru), currentLang: .en)
+            XCTAssertTrue(plan.decision.convert, typed)
+            XCTAssertFalse(InputPolicy.blocksAutomaticCorrection(typed, plan: plan), typed)
+            XCTAssertEqual(plan.prefix + plan.alternativeWord + plan.suffix, expected, typed)
+        }
+    }
+
+    func testKnownDomainSuffixOutranksDictionaryEvidenceForTheOtherLayout() {
+        let plan = CorrectionPlan(currentWord: "example.com", alternativeWord: "известный", suffix: "",
+                                  decision: Decision(convert: true, reason: "other-dict"))
+        XCTAssertTrue(InputPolicy.blocksAutomaticCorrection("example.com", plan: plan))
+        XCTAssertTrue(InputPolicy.blocksAutomaticCorrection("example.com.", plan: plan))
     }
 
     func testAddressesAndCodeTokensStayUntouched() {
-        for character in ["@", ":", "/", "\\", "_", "#", "=", "3"] {
+        for character in ["@", ":", "/", "\\", "_", "#", "=", "3", "+", "&", "%"] {
             XCTAssertTrue(InputPolicy.beginsStructuredToken(character), character)
         }
         XCTAssertTrue(InputPolicy.containsEmbeddedDot("example.com"))

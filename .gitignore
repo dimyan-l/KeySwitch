@@ -3,3 +3,4 @@ build/
 dist/
 PrivateBackup/
 .DS_Store
+generated_images/

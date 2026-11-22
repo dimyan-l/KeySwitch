@@ -1,7 +1,7 @@
 import AppKit
+import SwiftUI
 import ApplicationServices
 import Carbon
-import ServiceManagement
 
 enum Resources {
     /// Bundled dictionaries: KeySwitch.app/Contents/Resources/Dictionaries, or ./Resources/Dictionaries when run from the project folder.
@@ -17,16 +17,24 @@ enum Resources {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let layouts = KeyboardLayouts()
     private let store = UserStore()
-    private lazy var engine = SwitchEngine(layouts: layouts, store: store)
+    private lazy var engine = SwitchEngine(
+        layouts: layouts, store: store,
+        readFrontmostBundleID: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier },
+        verifyBackspaceUndo: CommandLine.arguments.contains("--backspace-undo") ? { text, pid in
+            FocusToken.capture(expectedPID: pid)?.matchesTextBeforeCaret(text) == true
+        } : nil
+    )
     private lazy var clipboard = ClipboardHistory(store: store)
     private let settings = Settings.shared
     private let motion = MotionBadge()
     private let selectionPanel = SelectionSuggestionPanel()
-    private lazy var preferences = PreferencesWindowController(store: store)
+    private lazy var preferences = PreferencesWindowController(store: store) { model in
+        AnyView(ApplicationProfilesView(model: model))
+    }
     private var selectionMonitors: [Any] = []
+    private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var selectionGeneration: UInt64 = 0
     private var selectedWord: SelectedWord?
-
     private var statusItem: NSStatusItem!
     private var permissionTimer: Timer?
     private var inputSourceTimer: Timer?
@@ -48,12 +56,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateStatusTitle()
         }
         preferences.model.reload = { [weak self] in self?.loadDictionaries() }
-        NotificationCenter.default.addObserver(forName: .keySwitchClearClipboard, object: nil, queue: .main) { [weak self] _ in self?.clipboard.clear() }
+        observe(NotificationCenter.default, .keySwitchClearClipboard) { [weak self] _ in self?.clipboard.clear() }
         engine.onSuggestionKey = { [weak self] code, flags in
-            guard flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return false }
+            guard flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift, .maskSecondaryFn]).isEmpty else { return false }
             return self?.selectionPanel.handleKey(code) ?? false
         }
-        statusItem = NSStatusBar.system.statusItem(withLength: 56)
+        statusItem = NSStatusBar.system.statusItem(withLength: 66)
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -76,9 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         engine.typer.updateFrontmostPID(NSWorkspace.shared.frontmostApplication?.processIdentifier)
         lastExternalApp = NSWorkspace.shared.frontmostApplication
 
-        _ = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] note in
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.didActivateApplicationNotification) { [weak self] note in
             guard let self else { return }
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             self.engine.frontmostBundleID = app?.bundleIdentifier
@@ -87,14 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.dismissSelectionSuggestions()
             if let app, app.bundleIdentifier != Bundle.main.bundleIdentifier { self.lastExternalApp = app }
         }
-        _ = DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
-        ) { [weak self] _ in
+        observe(DistributedNotificationCenter.default(), NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String)) { [weak self] _ in
             self?.inputSourceDidChange()
         }
-        _ = DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String), object: nil, queue: .main
-        ) { [weak self] _ in self?.layouts.refresh() }
+        observe(DistributedNotificationCenter.default(), NSNotification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String)) { [weak self] _ in self?.layouts.refresh() }
 
         loadDictionaries()
         clipboard.start()
@@ -116,7 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name,
+                         handler: @escaping @Sendable (Notification) -> Void) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main, using: handler)
+        observers.append((center, token))
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        permissionTimer?.invalidate()
+        inputSourceTimer?.invalidate()
+        for (center, token) in observers { center.removeObserver(token) }
+        observers.removeAll()
         for monitor in selectionMonitors { NSEvent.removeMonitor(monitor) }
         selectionPanel.hide()
         engine.stop()
@@ -213,11 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Observe independently of status rendering: other UI updates must not hide a source change.
     private func inputSourceDidChange() {
         let source = layouts.current()
-        let externalChange = layouts.observeInputSource(source.id)
-        if externalChange {
-            engine.cancelPendingTyping()
-            dismissSelectionSuggestions()
-        }
+        let externalChange = engine.inputSourceDidChange(to: source.id)
+        if externalChange { dismissSelectionSuggestions() }
         guard externalChange || source.id != lastInputSourceID else { return }
         layouts.refresh()
         updateStatusTitle()
@@ -229,6 +238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func secureInputDidChange() {
         guard secureInputState.observe(SecureInput.isEnabled) else { return }
+        KeyboardDiagnostics.record(.secureInputChanged)
         engine.cancelPendingTyping()
         dismissSelectionSuggestions()
         updateStatusTitle()
@@ -240,12 +250,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastInputSourceID = source.id
         if button.image == nil { motion.attach(to: button, language: source.lang) }
         motion.show(source.lang)
-        motion.setPaused(secureInputState.isEnabled || !engine.isRunning || !settings.autoEnabled)
+        motion.setPaused(secureInputState.isEnabled || !engine.isRunning || (!settings.autoEnabled && !settings.spellEnabled))
         // Keep the local animated layout badge; the lock is a separate title, not a replacement image.
         button.title = secureInputState.isEnabled ? "🔒" : ""
         button.imagePosition = secureInputState.isEnabled ? .imageLeading : .imageOnly
-        statusItem.length = secureInputState.isEnabled ? 76 : 56
-        button.toolTip = secureInputState.isEnabled ? secureInputExplanation : nil
+        statusItem.length = secureInputState.isEnabled ? 86 : 66
+        button.toolTip = secureInputState.isEnabled ? secureInputExplanation : "Выбрать раскладку или открыть настройки"
         button.setAccessibilityHelp(button.toolTip)
         button.alphaValue = 1
     }
@@ -253,11 +263,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Hotkeys
 
     private func handle(_ hk: Hotkey) {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
         waitForModifierRelease { [weak self] in
-            guard let self else { return }
-            switch hk {
-            case .flipSelection: self.flipSelection()
-            case .clipboardMenu: self.showClipboardPopup()
+            self?.engine.afterTyping { [weak self] in
+                guard let self, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                      !SecureInput.isEnabled else { return }
+                switch hk {
+                case .flipSelection:
+                    if !self.settings.isExcluded(self.engine.frontmostBundleID) { self.flipSelection() }
+                case .clipboardMenu: self.showClipboardPopup()
+                }
             }
         }
     }
@@ -275,91 +290,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func withSelection(_ body: @escaping (String, ClipboardHistory.Snapshot, FocusToken) -> Void) {
-        guard let focus = FocusToken.capture() else { NSSound.beep(); return }
-        engine.cancelPendingTyping()
-        guard let snap = clipboard.snapshot() else { NSSound.beep(); return }
-        clipboard.suspend(for: 3)
-        let pb = NSPasteboard.general
-        let before = pb.changeCount
-        engine.typer.run([.command(8), .pause(0.15)]) { finished in
-            guard finished, focus.isCurrent() else {
-                if pb.changeCount != before,
-                   NSWorkspace.shared.frontmostApplication?.processIdentifier == focus.pid {
-                    self.clipboard.restore(snap)
-                }
-                return
-            }
-            guard pb.changeCount != before, let s = pb.string(forType: .string), !s.isEmpty else {
-                if pb.changeCount != before { self.clipboard.restore(snap) }
-                NSSound.beep() // nothing selected
-                return
-            }
-            body(s, snap, focus)
-        }
-    }
-
-    private func replaceSelection(with text: String, snapshot: ClipboardHistory.Snapshot,
-                                  focus: FocusToken, target: Lang) {
-        guard focus.isCurrent() else { return }
-        let pb = NSPasteboard.general
-        clipboard.suspend(for: 3)
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        let temporaryChange = pb.changeCount
-        engine.typer.run([.command(9)]) { [weak self] finished in
-            if finished && focus.isCurrent() { self?.layouts.select(target) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                if pb.changeCount == temporaryChange { self?.clipboard.restore(snapshot) }
-            }
-        }
-        engine.resetAll()
-    }
-
     private func flipSelection() {
-        withSelection { [weak self] text, snap, focus in
-            guard let self else { return }
-            let flipped = self.layouts.flipText(text)
-            guard flipped != text else { self.clipboard.restore(snap); NSSound.beep(); return }
-            let cyr = flipped.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
-            self.replaceSelection(with: flipped, snapshot: snap, focus: focus, target: cyr ? .ru : .en)
+        dismissSelectionSuggestions()
+        let generation = selectionGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let selected = SelectedWord.capture(includePhrases: true)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.selectionGeneration == generation, !SecureInput.isEnabled else { return }
+                guard let selected else { NSSound.beep(); return }
+                let flipped = self.layouts.flipText(selected.text)
+                guard flipped != selected.text else { NSSound.beep(); return }
+                self.selectedWord = selected
+                let cyrillic = flipped.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                self.applySelectionSuggestion(flipped, switchTo: cyrillic ? .ru : .en)
+            }
         }
     }
 
     // MARK: - Selection suggestions
 
+    /// Right ⌥ next to a word that was missed earlier: put the caret inside the word or at
+    /// its edge, tap, and the word is re-read in the other layout (or a typo fix is offered).
     private func fixWordAtCaret() {
         dismissSelectionSuggestions()
         let generation = selectionGeneration
-        guard engine.isRunning, AXIsProcessTrusted(),
+        guard engine.isRunning, AXIsProcessTrusted(), !SecureInput.isEnabled,
               !settings.isExcluded(engine.frontmostBundleID) else { return }
+        let extra = layouts.letterPunctuation
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let selected = SelectedWord.captureAtCaret() else { return }
+            let capture = SelectedWord.captureAtCaret(extra: extra)
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.selectionGeneration == generation else { return }
-                let choices = SelectionCandidates.corrections(
-                    for: selected.text, classifier: self.engine.classifier,
-                    preferred: self.layouts.currentLang,
-                    flip: self.layouts.flipText(selected.text)
-                )
-                guard !choices.isEmpty else { return }
-                guard self.engine.isRunning,
-                      !self.settings.isExcluded(self.engine.frontmostBundleID),
-                      selected.selectIfCaretCurrent() else { return }
-                self.selectedWord = selected
-                if choices.count == 1 {
-                    self.applySelectionSuggestion(choices[0])
-                } else {
-                    self.selectionPanel.show(options: choices, bounds: selected.bounds) { [weak self] choice in
-                        self?.applySelectionSuggestion(choice)
+                guard let self, self.selectionGeneration == generation, self.engine.isRunning,
+                      !SecureInput.isEnabled, !self.settings.isExcluded(self.engine.frontmostBundleID) else { return }
+                switch capture {
+                case .noWord, .unsupported:
+                    return
+                case .word(let token):
+                    guard let plan = CaretFix.plan(token: token.text, classifier: self.engine.classifier,
+                                                   mixed: { self.layouts.repairMixedWord($0, classifier: self.engine.classifier) },
+                                                   flip: { self.layouts.flipText($0) }) else { return }
+                    let selected = token.narrowed(dropFirst: plan.dropFirst, dropLast: plan.dropLast)
+                    self.selectedWord = selected
+                    let apply: (String) -> Void = { [weak self] choice in
+                        if self?.applySelectionSuggestion(choice) == true { self?.learn(choice, from: plan) }
+                    }
+                    if plan.choices.count == 1 {
+                        apply(plan.choices[0])
+                    } else {
+                        self.selectionPanel.show(options: plan.choices, bounds: selected.bounds, onChoose: apply)
                     }
                 }
             }
         }
     }
 
+    private func learn(_ choice: String, from plan: CaretFix.Plan) {
+        if choice == plan.flip, plan.learnFlip { engine.learnPositive(choice, lang: plan.target) }
+    }
+
     private func observeSelection() {
-        let down = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] _ in
+        let down = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] event in
+            guard event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Typer.marker else { return }
             self?.dismissSelectionSuggestions()
         })
         if let down { selectionMonitors.append(down) }
@@ -368,7 +359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         if let up { selectionMonitors.append(up) }
         let keyUp = NSEvent.addGlobalMonitorForEvents(matching: [.keyUp], handler: { [weak self] event in
-            if event.modifierFlags.contains(.shift), (123...126).contains(event.keyCode) {
+            if event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Typer.marker,
+               event.modifierFlags.contains(.shift), (123...126).contains(event.keyCode) {
                 self?.scheduleSelectionSuggestions()
             }
         })
@@ -387,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self, self.selectionGeneration == generation,
                   self.settings.selectionSuggestionsEnabled,
-                  self.engine.isRunning, AXIsProcessTrusted(),
+                  self.engine.isRunning, AXIsProcessTrusted(), !SecureInput.isEnabled,
                   !self.settings.isExcluded(self.engine.frontmostBundleID) else { return }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let selected = SelectedWord.capture(), selected.isCurrent() else { return }
@@ -408,41 +400,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func applySelectionSuggestion(_ choice: String) {
-        guard let selected = selectedWord else { return }
+    /// Scheduled callers check selectionGeneration on main before reaching this point.
+    /// A single AX request replaces the verified range. AX does not offer compare-and-swap.
+    @discardableResult
+    private func applySelectionSuggestion(_ choice: String, switchTo target: Lang? = nil) -> Bool {
+        guard let selected = selectedWord, !SecureInput.isEnabled else { return false }
         selectionPanel.hide()
         selectedWord = nil
         selectionGeneration &+= 1
-        let generation = selectionGeneration
-        guard choice != selected.text else { NSSound.beep(); return }
+        guard choice != selected.text else { NSSound.beep(); return false }
         engine.cancelPendingTyping()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard selected.isCurrent() else { return }
-            let replaced = selected.replaceDirectly(with: choice)
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.selectionGeneration == generation else { return }
-                if replaced { self.motion.acknowledgeCorrection(); self.preferences.model.record(selected.text, choice) }
-                else { self.pasteSelectedSuggestion(choice, selected: selected) }
-            }
+        guard selected.selectIfCaretCurrent(), selected.replaceDirectly(with: choice) else {
+            NSSound.beep()
+            return false
         }
-    }
-
-    private func pasteSelectedSuggestion(_ choice: String, selected: SelectedWord) {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == selected.focus.pid else { return }
-        guard selected.isCurrent() else { return }
-        guard let snapshot = clipboard.snapshot() else { NSSound.beep(); return }
-        clipboard.suspend(for: 3)
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(choice, forType: .string)
-        let temporaryChange = pb.changeCount
-        engine.typer.run([.command(9)]) { [weak self] finished in
-            guard let self else { return }
-            if finished { self.motion.acknowledgeCorrection(); self.preferences.model.record(selected.text, choice) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                if pb.changeCount == temporaryChange { self.clipboard.restore(snapshot) }
-            }
-        }
+        if let target { layouts.select(target) }
+        motion.acknowledgeCorrection()
+        preferences.model.record(selected.text, choice)
+        return true
     }
 
     private func showClipboardPopup() {
@@ -455,14 +430,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func pasteClip(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String else { return }
+        guard let s = sender.representedObject as? String, let app = lastExternalApp,
+              !SecureInput.isEnabled else { return }
         clipboard.write(s)
-        let app = lastExternalApp
+        let change = NSPasteboard.general.changeCount
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            if let app, NSWorkspace.shared.frontmostApplication != app { app.activate(options: []) }
+            let currentPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            guard !SecureInput.isEnabled, NSPasteboard.general.changeCount == change,
+                  currentPID == app.processIdentifier || currentPID == ProcessInfo.processInfo.processIdentifier else { return }
+            if currentPID != app.processIdentifier { app.activate(options: []) }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                guard let app, NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
-                self.engine.typer.run([.command(9)])
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                      !SecureInput.isEnabled, NSPasteboard.general.changeCount == change else { return }
+                self.engine.typer.updateFrontmostPID(app.processIdentifier)
+                self.engine.typer.run([.command(9)], targetPID: app.processIdentifier)
             }
         }
     }
@@ -478,7 +459,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         secureInputDidChange()
         menu.removeAllItems()
         let language = layouts.currentLang?.label ?? "—"
-        let state = secureInputState.isEnabled ? "🔒 Защищённый ввод" : (engine.isRunning && settings.autoEnabled ? "Работает" : "Пауза")
+        let state: String
+        if secureInputState.isEnabled { state = "🔒 Защищённый ввод" }
+        else if !engine.isRunning { state = "Пауза" }
+        else { state = settings.autoEnabled || settings.spellEnabled ? "Работает" : "Ручной режим" }
         menu.addItem(ClipboardHistory.header("KeySwitch · \(language) · \(state)"))
         if secureInputState.isEnabled {
             menu.addItem(ClipboardHistory.header("macOS блокирует перехват клавиш и исправления."))
@@ -490,11 +474,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !layouts.hasBothLayouts { menu.addItem(ClipboardHistory.header("Включите русскую и английскую раскладки")) }
         menu.addItem(.separator())
-        menu.addItem(item("Автоисправления", #selector(toggleAuto), checked: settings.autoEnabled))
+        let languageMenu = NSMenu()
+        languageMenu.autoenablesItems = false
+        for lang in Lang.allCases {
+            let option = item(lang == .en ? "English · EN" : "Русский · RU", #selector(selectLanguage(_:)),
+                              checked: layouts.currentLang == lang)
+            option.representedObject = lang.rawValue
+            option.isEnabled = layouts.preferred[lang] != nil
+            languageMenu.addItem(option)
+        }
+        let switchItem = NSMenuItem(title: "Сменить раскладку", action: nil, keyEquivalent: "")
+        switchItem.submenu = languageMenu
+        menu.addItem(switchItem)
+        menu.addItem(item("Автосмена раскладки", #selector(toggleAuto), checked: settings.autoEnabled))
+        menu.addItem(item("Исправлять опечатки", #selector(toggleSpell), checked: settings.spellEnabled))
         menu.addItem(item(engine.isRunning ? "Приостановить KeySwitch" : "Возобновить KeySwitch", #selector(toggleInterception)))
         if let app = lastExternalApp, let id = app.bundleIdentifier {
-            let entry = item("Не исправлять в \(app.localizedName ?? id)", #selector(toggleExclude(_:)), checked: settings.isExcluded(id))
-            entry.representedObject = id
+            let entry = NSMenuItem(title: "Режим в \(app.localizedName ?? id)", action: nil, keyEquivalent: "")
+            let modes = NSMenu()
+            let current = settings.applicationModes[id] ?? .inherit
+            for mode in ApplicationCorrectionMode.allCases {
+                let option = item(mode.title, #selector(setApplicationMode(_:)), checked: mode == current)
+                option.representedObject = [id, mode.rawValue]
+                modes.addItem(option)
+            }
+            entry.submenu = modes
             menu.addItem(entry)
         }
         let clipItem = NSMenuItem(title: "Буфер обмена · ⌃⌥V", action: nil, keyEquivalent: "")
@@ -506,11 +510,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let settingsItem = item("Настройки…", #selector(showPreferences))
         settingsItem.keyEquivalent = ","
         menu.addItem(settingsItem)
+        menu.addItem(item("Как пользоваться…", #selector(showHelp)))
         menu.addItem(ClipboardHistory.header("Исправлено сегодня: \(engine.correctionsToday)"))
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
     @objc private func showPreferences() { preferences.present() }
+    @objc private func showHelp() { preferences.presentHelp() }
 
     private func item(_ title: String, _ action: Selector, checked: Bool = false) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -519,74 +525,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
-    private func rulesMenuItem() -> NSMenuItem {
-        let active = store.rules.active
-        let top = NSMenuItem(title: "Не исправлять слова (\(active.count))", action: nil, keyEquivalent: "")
-        let menu = NSMenu()
-        for language in Lang.allCases {
-            let languageItem = NSMenuItem(title: language.rawValue.uppercased(), action: nil, keyEquivalent: "")
-            let languageMenu = NSMenu()
-            let choices: [(String, FixKind?)] = [
-                ("Добавить: не менять раскладку…", .layout),
-                ("Добавить: не исправлять опечатку…", .spell),
-                ("Добавить: не исправлять вообще…", nil),
-            ]
-            for (title, kind) in choices {
-                let entry = item(title, #selector(addRuleFromMenu(_:)))
-                entry.representedObject = "\(language.rawValue)|\(kind?.rawValue ?? "all")"
-                languageMenu.addItem(entry)
-            }
-            let existing = active.filter { $0.lang == language }
-            if !existing.isEmpty {
-                languageMenu.addItem(.separator())
-                for rule in existing {
-                    let entry = item("Удалить: \(rule.word) · \(rule.scopeTitle)", #selector(removeRuleFromMenu(_:)))
-                    entry.representedObject = rule.id
-                    languageMenu.addItem(entry)
-                }
-            }
-            languageItem.submenu = languageMenu
-            menu.addItem(languageItem)
-        }
-        top.submenu = menu
-        return top
-    }
-
-    @objc private func addRuleFromMenu(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        let parts = key.split(separator: "|")
-        guard parts.count == 2, let lang = Lang(rawValue: String(parts[0])) else { return }
-        let kind = parts[1] == "all" ? nil : FixKind(rawValue: String(parts[1]))
-        guard parts[1] == "all" || kind != nil else { return }
-        let alert = NSAlert()
-        alert.messageText = "Слово, которое не нужно исправлять"
-        alert.informativeText = "Язык: \(lang.rawValue.uppercased()). Одно слово без пробелов."
-        alert.addButton(withTitle: "Добавить")
-        alert.addButton(withTitle: "Отмена")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        field.placeholderString = "Введите слово"
-        alert.accessoryView = field
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let word = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if store.addRule(word, lang: lang, kind: kind) == nil { NSSound.beep() }
-    }
-
-    @objc private func removeRuleFromMenu(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        store.removeRule(id)
-        loadDictionaries()
-    }
-
     // MARK: - Menu actions
 
-    @objc private func toggleAuto() { settings.autoEnabled.toggle(); engine.resetAll(); updateStatusTitle() }
-    @objc private func toggleCautious() { settings.cautiousMode.toggle(); engine.resetAll() }
-    @objc private func toggleSpell() { settings.spellEnabled.toggle(); engine.resetAll() }
-    @objc private func toggleSelectionSuggestions() {
-        settings.selectionSuggestionsEnabled.toggle()
-        dismissSelectionSuggestions()
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let language = Lang(rawValue: raw) else { return }
+        if layouts.select(language) { inputSourceDidChange() } else { NSSound.beep() }
     }
+
+    @objc private func toggleAuto() { settings.autoEnabled.toggle(); preferences.model.onChange(); preferences.model.refresh() }
+    @objc private func toggleSpell() { settings.spellEnabled.toggle(); preferences.model.onChange(); preferences.model.refresh() }
     @objc private func toggleInterception() {
         if engine.isRunning {
             engine.stop()
@@ -599,85 +546,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         updateStatusTitle()
     }
-    @objc private func toggleSound() { settings.sound.toggle() }
-    @objc private func toggleExclude(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        settings.toggleExcluded(id)
-    }
-    @objc private func menuFlip() { refocus { self.flipSelection() } }
-    @objc private func clearClipboard() { clipboard.clear() }
-
-    private func refocus(_ body: @escaping () -> Void) {
-        guard let app = lastExternalApp else { return }
-        app.activate(options: [])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
-            body()
-        }
-    }
-
-    @objc private func openAccessibility() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func openInputMonitoring() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func openUserFolder() { NSWorkspace.shared.open(UserStore.directory) }
-    @objc private func reloadDictionaries() { layouts.refresh(); loadDictionaries() }
-
-    @objc private func forgetLearned() {
-        guard confirm("Забыть всё, чему KeySwitch научился?", "Слова из my_ru.txt / my_en.txt останутся.") else { return }
-        store.forgetAllLearned()
-        loadDictionaries()
-    }
-
-    @objc private func toggleLogin() {
-        do {
-            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
-            else { try SMAppService.mainApp.register() }
-        } catch {
-            lastError = "Автозапуск: \(error.localizedDescription). Переместите KeySwitch.app в /Applications."
-            NSSound.beep()
-        }
-    }
-
-    @objc private func showHelp() {
-        info("KeySwitch — как пользоваться", """
-        • Пишите как обычно. Если слово набрано не в той раскладке, после пробела/Enter/знака оно исправится, а раскладка переключится.
-        • Опечатки в известных словах исправляются после пробела/Enter/знака. Пункт «Исправлять опечатки» в меню включает и выключает эту функцию.
-        • Осторожный режим: неоднозначное слово не перепечатывается; оранжевый отклик плашки предлагает исправить его правым ⌥.
-        • Правый ⌥ (нажать и отпустить): сразу после автоисправления — отменить его (и запомнить слово); в середине слова или сразу после него — исправить это слово.
-        • ⌃⌥R — сменить раскладку выделенного текста.
-        • Выделите одно слово мышью или клавишами Shift+стрелка: над ним появятся варианты исправления и регистра. Замена происходит только после выбора.
-        • ⌃⌥V — история буфера обмена: клик или цифра 1–9 вставляет, с ⌥ — закрепить/открепить.
-        • Свои слова: меню → Словари → my_ru.txt / my_en.txt.
-        • Исключения для раскладки и опечаток: меню → Словари → «Не исправлять слова».
-        """)
-    }
-
-    // MARK: - Dialog helpers
-
-    private func info(_ title: String, _ message: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.runModal()
-    }
-
-    private func confirm(_ title: String, _ message: String) -> Bool {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "Да")
-        alert.addButton(withTitle: "Отмена")
-        return alert.runModal() == .alertFirstButtonReturn
+    @objc private func setApplicationMode(_ sender: NSMenuItem) {
+        guard let values = sender.representedObject as? [String], values.count == 2,
+              let mode = ApplicationCorrectionMode(rawValue: values[1]) else { return }
+        settings.setApplicationMode(mode, for: values[0])
+        preferences.model.onChange()
+        preferences.model.refresh()
     }
 }

@@ -15,12 +15,16 @@ final class Typer {
     }
 
     private let queue: DispatchQueue
-    private let eventSink: (CGEvent) -> Void
+    private let eventSink: (CGEvent, pid_t) -> Void
+    private let protectedInput: () -> Bool
 
     init(queue: DispatchQueue = DispatchQueue(label: "keyswitch.typer"),
-         eventSink: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
+         eventSink: ((CGEvent) -> Void)? = nil,
+         targetedSink: @escaping (CGEvent, pid_t) -> Void = { event, pid in event.postToPid(pid) },
+         protectedInput: @escaping () -> Bool = { SecureInput.isEnabled }) {
         self.queue = queue
-        self.eventSink = eventSink
+        self.eventSink = eventSink.map { sink in { event, _ in sink(event) } } ?? targetedSink
+        self.protectedInput = protectedInput
     }
     private let lock = NSLock()
     private var epoch: UInt64 = 0
@@ -29,8 +33,17 @@ final class Typer {
 
     /// Called on the tap/main thread after a rewrite, preserving the original event fields.
     func replay(_ event: CGEvent) {
+        lock.lock()
+        let pid = activePID
+        lock.unlock()
+        guard let pid else { return }
+        replay(event, to: pid)
+    }
+
+    func replay(_ event: CGEvent, to pid: pid_t) {
+        guard !protectedInput(), isTargetActive(pid) else { return }
         event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
-        eventSink(event)
+        eventSink(event, pid)
     }
 
     func cancel() {
@@ -44,6 +57,12 @@ final class Typer {
         lock.lock()
         activePID = pid
         lock.unlock()
+    }
+
+    func isTargetActive(_ pid: pid_t) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activePID == pid
     }
 
     private var activePID: pid_t?
@@ -61,6 +80,7 @@ final class Typer {
     }
 
     private func isCurrent(_ runEpoch: UInt64, targetPID: pid_t?) -> Bool {
+        guard !protectedInput() else { return false }
         lock.lock()
         defer { lock.unlock() }
         // An unknown target is never "current": never post into an unidentified app.
@@ -77,7 +97,7 @@ final class Typer {
             }
         case .text(let string):
             for character in string {
-                if character == "\n" || character == "\r" {
+                if character == "\n" || character == "\r" || character == "\r\n" {
                     guard postKeyPair(key: 36, flags: .maskShift, epoch: runEpoch, targetPID: targetPID) else { return false }
                 } else {
                     guard postUnicodePair(String(character), epoch: runEpoch, targetPID: targetPID) else { return false }
@@ -111,9 +131,9 @@ final class Typer {
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
         }
-        guard isCurrent(runEpoch, targetPID: targetPID) else { return false }
-        eventSink(down)
-        eventSink(up)
+        guard let targetPID, isCurrent(runEpoch, targetPID: targetPID) else { return false }
+        eventSink(down, targetPID)
+        eventSink(up, targetPID)
         return true
     }
 
@@ -129,9 +149,9 @@ final class Typer {
             }
             event.setIntegerValueField(.eventSourceUserData, value: Self.marker)
         }
-        guard isCurrent(runEpoch, targetPID: targetPID) else { return false }
-        eventSink(down)
-        eventSink(up)
+        guard let targetPID, isCurrent(runEpoch, targetPID: targetPID) else { return false }
+        eventSink(down, targetPID)
+        eventSink(up, targetPID)
         return true
     }
 }

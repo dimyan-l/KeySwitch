@@ -2,6 +2,23 @@ import XCTest
 @testable import KeySwitch
 
 final class PreferencesTests: XCTestCase {
+    func testApplicationModesKeepLegacyExclusionsAndPersistOverrides() throws {
+        let suite = "test.applicationModes.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: defaults)
+        let terminal = "com.apple.Terminal"
+        let browser = "com.example.browser"
+        XCTAssertEqual(settings.applicationMode(for: terminal), .off)
+        settings.setApplicationMode(.manual, for: terminal)
+        settings.setApplicationMode(.confirm, for: browser)
+        XCTAssertFalse(settings.isExcluded(terminal))
+        XCTAssertFalse(settings.applicationMode(for: terminal).allowsAutomatic)
+        XCTAssertTrue(Settings(defaults: defaults).applicationMode(for: browser).isCautious(defaultValue: false))
+        settings.setApplicationMode(.inherit, for: terminal)
+        XCTAssertTrue(settings.isExcluded(terminal))
+    }
+
     func testPrivacyDefaultsAreOffAndExplicitPreferencesSurvive() throws {
         let suite = "KeySwitchTests." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
