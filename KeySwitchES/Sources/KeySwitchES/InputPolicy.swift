@@ -30,7 +30,7 @@ enum InputPolicy {
 
     static func blocksAutomaticCorrection(_ text: String, plan: CorrectionPlan) -> Bool {
         guard containsEmbeddedDot(text) else { return false }
-        if looksLikeDomainOrIdentifier(text) { return true }
+        if looksLikeDomainOrIdentifier(text) && !isClearCyrillicWord(plan) { return true }
         // On QWERTY, '.' is the physical key for Russian 'ю'. Allow a known Cyrillic
         // reading (even followed by sentence punctuation like '.' or ',') or a confident
         // Cyrillic n-gram reading when the typed token clearly isn't a domain or code identifier.
@@ -48,6 +48,17 @@ enum InputPolicy {
         default:
             return true
         }
+    }
+
+    /// "cktle.obq" has vowels on both sides of the dot like "object.method", but its other
+    /// reading is the dictionary word "следующий" ('.' is the key of 'ю'). A known domain
+    /// ending ("b.kz") still wins: that token is far more likely an address.
+    private static func isClearCyrillicWord(_ plan: CorrectionPlan) -> Bool {
+        guard plan.decision.convert, plan.decision.reason == "other-dict", plan.suffix.isEmpty, plan.prefix.isEmpty,
+              plan.alternativeWord.count >= 4,
+              plan.alternativeWord.unicodeScalars.allSatisfy({ (0x0400...0x04FF).contains($0.value) }) else { return false }
+        let last = plan.currentWord.lowercased().split(separator: ".").last.map(String.init) ?? ""
+        return !domainOrCodeExtensions.contains(last)
     }
 
     private static func looksLikeDomainOrIdentifier(_ token: String) -> Bool {
