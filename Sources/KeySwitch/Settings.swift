@@ -95,6 +95,21 @@ final class Settings {
 
 }
 
+/// One word KeySwitch replaced. Kept with no time limit so that returning to the word later
+/// (right ⌥ at the caret, or a selection) can put the original back and remember the decision.
+struct CorrectionRecord: Codable, Equatable {
+    let replacement: String     // the word as KeySwitch typed it ("беги")
+    let original: String        // the word as the user typed it ("баги")
+    let lang: Lang              // language of `original`
+    let originalWord: String    // normalized core of `original`, the rule key
+    let kind: FixKind
+    /// Automatic changes become exceptions when reverted; manual flips just toggle.
+    let automatic: Bool
+    let date: Date
+
+    var key: String { normalizeWord(replacement) }
+}
+
 /// Persistent learned words and per-language exceptions for automatic changes.
 final class UserStore {
     private struct Payload: Codable {
@@ -172,6 +187,10 @@ final class UserStore {
     private(set) var rules = RuleBook()
     private(set) var saveError: String?
     private var canSave = true
+    /// Replacements by normalized replacement text: the newest one for each word.
+    private(set) var corrections: [String: CorrectionRecord] = [:]
+    private let correctionsURL: URL
+    private var canSaveCorrections = true
 
     init(directory: URL? = nil,
          bundledRulesURL: URL? = Bundle.main.resourceURL?.appendingPathComponent("DefaultRules.json"),
@@ -180,8 +199,10 @@ final class UserStore {
         self.directory = directory ?? Self.defaultDirectory(create: !cloudBlocked)
         self.bundledRulesURL = bundledRulesURL
         url = self.directory.appendingPathComponent("learned.json")
+        correctionsURL = self.directory.appendingPathComponent("corrections.json")
         if cloudBlocked {
             canSave = false
+            canSaveCorrections = false
             saveError = "iCloudSync is enabled, but this build cannot safely sync learned.json. Use the upstream app to disable sync after backing up both local and iCloud KeySwitch folders, then relaunch. No local or cloud files were changed."
             return
         }
@@ -193,6 +214,7 @@ final class UserStore {
             }
         }
         rules = RuleBook(payload.rules)
+        loadCorrections()
         seedBundledRules()
         seedCustomLists()
     }
@@ -231,6 +253,56 @@ final class UserStore {
         if !list.contains(w) { list.append(w) }
         payload.learned[lang.rawValue] = list
         save()
+    }
+
+    // MARK: - Replacement history (corrections.json)
+
+    func correction(producing text: String) -> CorrectionRecord? {
+        let key = normalizeWord(text)
+        return key.isEmpty ? nil : corrections[key]
+    }
+
+    func recordCorrection(_ record: CorrectionRecord) {
+        corrections[record.key] = record
+        saveCorrections()
+    }
+
+    func removeCorrection(producing text: String) {
+        guard corrections.removeValue(forKey: normalizeWord(text)) != nil else { return }
+        saveCorrections()
+    }
+
+    func clearCorrections() {
+        corrections.removeAll()
+        saveCorrections()
+    }
+
+    private func loadCorrections() {
+        guard FileManager.default.fileExists(atPath: correctionsURL.path) else { return }
+        do {
+            let list = try JSONDecoder().decode([CorrectionRecord].self, from: Data(contentsOf: correctionsURL))
+            for record in list.sorted(by: { $0.date < $1.date }) { corrections[record.key] = record }
+        } catch {
+            // Do not overwrite a file this version cannot read.
+            canSaveCorrections = false
+            saveError = "Не удалось прочитать corrections.json: \(error.localizedDescription)"
+        }
+    }
+
+    private func saveCorrections() {
+        guard canSaveCorrections else { return }
+        let list = corrections.values.sorted { $0.date < $1.date }
+        guard let data = try? JSONEncoder().encode(list) else { return }
+        let url = correctionsURL
+        // Called from the keyboard tap: never block typing on disk I/O.
+        UserStore.ioQueue.async { [weak self] in
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                let message = "Не удалось сохранить corrections.json: \(error.localizedDescription)"
+                DispatchQueue.main.async { self?.saveError = message }
+            }
+        }
     }
 
     func forget(_ word: String, lang: Lang) {

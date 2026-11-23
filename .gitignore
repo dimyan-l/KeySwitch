@@ -4,3 +4,4 @@ dist/
 PrivateBackup/
 .DS_Store
 generated_images/
+__pycache__/

@@ -210,5 +210,29 @@ final class ClassifierTests: XCTestCase {
         XCTAssertNil(AutomaticCorrection.spelling(current: "GitHub", alternative: "", model: en, other: ru, rules: rules))
         XCTAssertNil(AutomaticCorrection.spelling(current: "some.name", alternative: "", model: en, other: ru, rules: rules))
     }
-}
 
+    private func russianSpelling(_ word: String, _ c: Classifier) -> String? {
+        AutomaticCorrection.spelling(current: word, alternative: SelfTest.flip(word, to: .en),
+                                     model: c.models[.ru]!, other: c.models[.en], rules: RuleBook())?.text
+    }
+
+    func testValidRussianWordsAreNotTypoFixed() throws {
+        let c = try classifier()
+        // Real words missing from the frequency list must not become other words.
+        XCTAssertNil(russianSpelling("баги", c), "баги is not беги")
+        XCTAssertNil(russianSpelling("сверить", c), "a leading prefix letter is not a typo")
+        XCTAssertNil(russianSpelling("багами", c))
+        // Ordinary typos are still fixed.
+        XCTAssertEqual(russianSpelling("превет", c), "привет")
+        XCTAssertEqual(russianSpelling("Превет", c), "Привет")
+    }
+
+    func testWordFormsProtectMissingInflections() {
+        let model = LanguageModel(lang: .ru)
+        for form in ["сверка", "сверки", "сверку"] { model.add(form, score: 3) }
+        model.add("свекла", score: 5)
+        XCTAssertTrue(WordForms.hasKnownSiblings("сверкой", model: model))
+        XCTAssertFalse(WordForms.hasKnownSiblings("свеклп", model: model))
+        XCTAssertFalse(WordForms.hasKnownSiblings("hello", model: LanguageModel(lang: .en)))
+    }
+}

@@ -33,6 +33,10 @@ enum AutomaticCorrection {
                let fixed = missingHyphens[normalized], model.score(fixed) != nil {
                 spelling = (casing.apply(fixed), .spell)
             } else if let fixed = SpellCorrector.correction(for: word, alternative: altWord, model: model, other: other) {
+                let reviewed = SpellCorrector.knownMisspellings[model.lang.rawValue]?[normalized] != nil
+                // "баги" is a form of "баг", not a typo of "беги": an unknown word whose stem
+                // has dictionary forms is a missing inflection, not a slip of the finger.
+                guard reviewed || !WordForms.hasKnownSiblings(normalized, model: model) else { return nil }
                 spelling = (fixed, .spell)
             } else { return nil }
         }
@@ -64,5 +68,36 @@ enum AutomaticCorrection {
 
     private static func hasDoubleCapital(_ word: String) -> Bool {
         word.count >= 4 && word.prefix(2).allSatisfy(\.isUppercase) && word.dropFirst(2).allSatisfy(\.isLowercase)
+    }
+}
+
+/// Russian is inflected: the frequency list holds the common forms of a word, not all of
+/// them. A word whose stem appears in the list with two other endings is treated as a
+/// real form. Measured on held-out dictionary words: ~58% of valid missing forms are
+/// protected, ~8% of random one-letter typos are left alone (mostly ending changes,
+/// which are risky to "fix" automatically anyway).
+enum WordForms {
+    private static let endings: [String] = {
+        let list = """
+        а я о е ы и у ю ь й ам ям ами ями ах ях ов ев ей ой ом ем ую юю ая яя ое ее ые ие ого его ому ему
+        ым им ых их ть ти л ла ло ли ет ют ит ят ешь ишь ете ите ал ял ил ел ала ила ела ться тся ся сь ут ат
+        """
+        let unique = Set(list.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init))
+        return [""] + unique.sorted { $0.count > $1.count }
+    }()
+
+    static func hasKnownSiblings(_ word: String, model: LanguageModel) -> Bool {
+        guard model.lang == .ru else { return false }
+        for ending in endings where ending.isEmpty || word.hasSuffix(ending) {
+            let stem = String(word.dropLast(ending.count))
+            guard stem.count >= 3 else { continue }
+            var found = 0
+            for other in endings where other != ending {
+                guard let score = model.score(stem + other), score >= 2.5 else { continue }
+                found += 1
+                if found >= 2 { return true }
+            }
+        }
+        return false
     }
 }

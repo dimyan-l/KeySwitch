@@ -278,4 +278,119 @@ final class LayoutTransitionTests: XCTestCase {
         XCTAssertFalse(engine.isTyping)
     }
 
+
+    // MARK: - Remembering reverted corrections
+
+    private func spellingEngine(typer: Typer, accepts: ((String, Lang) -> Bool)? = nil) throws -> SwitchEngine {
+        let (en, _) = try sources()
+        let layouts = KeyboardLayouts(sources: [.en: en], readSource: { en })
+        let id = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(id)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let suite = "keyswitch.restore.\(id)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let settings = Settings(defaults: defaults)
+        settings.spellEnabled = true
+        let engine = SwitchEngine(layouts: layouts, store: UserStore(directory: directory, bundledRulesURL: nil),
+                                  typer: typer, settings: settings, frontmostPID: { 123 }, acceptsSpelling: accepts)
+        let english = LanguageModel(lang: .en)
+        english.add("hello", score: 8)
+        english.add("address", score: 8)
+        engine.classifier = Classifier(models: [.en: english])
+        return engine
+    }
+
+    private func settle(_ engine: SwitchEngine) {
+        let done = expectation(description: "typing released")
+        engine.afterTyping { done.fulfill() }
+        wait(for: [done], timeout: 2)
+    }
+
+    func testRetypingTheOriginalWordAfterErasingTheFixRemembersIt() throws {
+        let typer = Typer(queue: DispatchQueue(label: "test.restore"), eventSink: { _ in })
+        let engine = try spellingEngine(typer: typer)
+        let hellp: [UInt16] = [4, 14, 37, 37, 35]
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine), "hellp is fixed to hello")
+        settle(engine)
+        XCTAssertEqual(engine.recentCorrection(producing: "Hello")?.original, "hellp")
+
+        for _ in 0..<6 { XCTAssertTrue(passes(key(51), through: engine)) }
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine), "the word typed again is left alone")
+        XCTAssertTrue(engine.store.rules.blocks("hellp", lang: .en, kind: .spell))
+        XCTAssertEqual(engine.store.rules.active.first?.source, .restore)
+        XCTAssertNil(engine.recentCorrection(producing: "hello"))
+
+        // From now on the exception holds without any erasing.
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine))
+    }
+
+    func testRetypingWithoutErasingOrAfterNavigationIsNotAnException() throws {
+        let typer = Typer(queue: DispatchQueue(label: "test.restore-nav"), eventSink: { _ in })
+        let engine = try spellingEngine(typer: typer)
+        let hellp: [UInt16] = [4, 14, 37, 37, 35]
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine))
+        settle(engine)
+        XCTAssertTrue(passes(key(123), through: engine)) // ← moves the caret elsewhere
+        for _ in 0..<6 { XCTAssertTrue(passes(key(51), through: engine)) }
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine), "the same typo is fixed again")
+        settle(engine)
+        XCTAssertTrue(engine.store.rules.active.isEmpty, "\(engine.store.rules.active) tracked=\(engine.trackedWordLength)")
+    }
+
+    func testRestoringARecentCorrectionAddsAnUndoRuleOnlyForAutomaticChanges() throws {
+        let engine = try spellingEngine(typer: Typer(eventSink: { _ in }))
+        engine.record(replacement: "беги", original: "баги", lang: .ru, kind: .spell)
+        engine.record(replacement: "работа", original: "hf,jnf", lang: .en, originalWord: "hf,jnf",
+                      kind: .layout, automatic: false)
+        let auto = try XCTUnwrap(engine.recentCorrection(producing: "Беги"))
+        engine.remember(auto, source: .undo)
+        XCTAssertTrue(engine.store.rules.blocks("баги", lang: .ru, kind: .spell))
+        let manual = try XCTUnwrap(engine.recentCorrection(producing: "работа"))
+        engine.remember(manual, source: .undo)
+        XCTAssertEqual(engine.store.rules.active.count, 1, "a manual flip only toggles")
+        XCTAssertTrue(engine.recentCorrections.isEmpty)
+    }
+
+    func testMacOSSpellCheckerVetoesAutomaticTypoFix() throws {
+        var asked: [String] = []
+        let engine = try spellingEngine(typer: Typer(eventSink: { _ in }), accepts: { word, lang in
+            asked.append(word)
+            XCTAssertEqual(lang, .en)
+            return true
+        })
+        for code: UInt16 in [0, 2, 15, 14, 1, 1] { // adress
+            XCTAssertTrue(passes(key(code), through: engine))
+        }
+        XCTAssertTrue(passes(key(49), through: engine), "a word macOS accepts is not changed")
+        XCTAssertEqual(asked, ["adress"])
+    }
+
+    func testReplacementHistoryPersistsWithoutExpiry() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let first = UserStore(directory: directory, bundledRulesURL: nil)
+        let old = Date(timeIntervalSinceNow: -400 * 86_400)
+        first.recordCorrection(CorrectionRecord(replacement: "беги", original: "баги", lang: .ru, originalWord: "баги",
+                                                kind: .spell, automatic: true, date: old))
+        first.recordCorrection(CorrectionRecord(replacement: "привет", original: "ghbdtn", lang: .en, originalWord: "ghbdtn",
+                                                kind: .layout, automatic: true, date: Date()))
+        first.flushPendingWrites()
+
+        let second = UserStore(directory: directory, bundledRulesURL: nil)
+        XCTAssertEqual(second.correction(producing: "Беги")?.original, "баги", "a year-old replacement is still known")
+        XCTAssertEqual(second.correction(producing: "ПРИВЕТ")?.original, "ghbdtn")
+        second.removeCorrection(producing: "беги")
+        second.flushPendingWrites()
+        XCTAssertNil(UserStore(directory: directory, bundledRulesURL: nil).correction(producing: "беги"))
+        second.clearCorrections()
+        second.flushPendingWrites()
+        XCTAssertTrue(UserStore(directory: directory, bundledRulesURL: nil).corrections.isEmpty)
+    }
 }
