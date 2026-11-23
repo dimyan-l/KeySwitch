@@ -51,7 +51,7 @@ enum SpellCorrector {
 
         var best: (word: String, score: Float, raw: Float)?
         var runnerUp: Float?
-        for (candidate, likely) in candidates(word, letters: model.letters, swapsOnly: shortWord) {
+        for (candidate, likely) in candidates(word, letters: model.letters, swapsOnly: shortWord, keepFirstLetter: true) {
             guard let raw = model.score(candidate), raw >= minScore else { continue }
             let score = raw + (likely ? likelyEditBonus : 0)
             if let current = best {
@@ -131,7 +131,10 @@ enum SpellCorrector {
     }
 
     /// All words one edit away, flagged when the edit is a typical slip of the finger.
-    private static func candidates(_ word: String, letters: Set<Character>, swapsOnly: Bool) -> [String: Bool] {
+    /// `keepFirstLetter`: automatic fixes never add or drop the first letter. A leading letter is
+    /// usually a prefix or preposition of a real word ("сверить" is not "верить"), not a slip.
+    private static func candidates(_ word: String, letters: Set<Character>, swapsOnly: Bool,
+                                   keepFirstLetter: Bool = false) -> [String: Bool] {
         let chars = Array(word)
         let alphabet = Array(letters)
         var result: [String: Bool] = [:]
@@ -146,20 +149,22 @@ enum SpellCorrector {
         }
         if !swapsOnly {
             for i in chars.indices {
+                // A doubled first letter ("ппривет") is still removed: deleting either copy gives the same word.
+                let dropsFirstLetter = keepFirstLetter && i == 0 && (chars.count < 2 || chars[1] != chars[0])
                 var deletion = chars
                 deletion.remove(at: i)
                 // Extra doubled letter or a neighbouring key pressed together with the right one.
                 let likely = (i > 0 && chars[i - 1] == chars[i]) || (i + 1 < chars.count && chars[i + 1] == chars[i])
                     || (i > 0 && areNeighbours(chars[i - 1], chars[i]))
                     || (i + 1 < chars.count && areNeighbours(chars[i + 1], chars[i]))
-                add(deletion, likely: likely)
+                if !dropsFirstLetter { add(deletion, likely: likely) }
                 for letter in alphabet where letter != chars[i] {
                     var replacement = chars
                     replacement[i] = letter
                     add(replacement, likely: areNeighbours(letter, chars[i]))
                 }
             }
-            for i in 0...chars.count {
+            for i in (keepFirstLetter ? 1 : 0)...chars.count {
                 for letter in alphabet {
                     var insertion = chars
                     insertion.insert(letter, at: i)

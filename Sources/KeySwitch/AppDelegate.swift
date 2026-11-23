@@ -22,7 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         readFrontmostBundleID: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier },
         verifyBackspaceUndo: CommandLine.arguments.contains("--backspace-undo") ? { text, pid in
             FocusToken.capture(expectedPID: pid)?.matchesTextBeforeCaret(text) == true
-        } : nil
+        } : nil,
+        acceptsSpelling: { SystemSpelling.accepts($0, lang: $1) }
     )
     private lazy var clipboard = ClipboardHistory(store: store)
     private let settings = Settings.shared
@@ -99,6 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observe(DistributedNotificationCenter.default(), NSNotification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String)) { [weak self] _ in self?.layouts.refresh() }
 
         loadDictionaries()
+        DispatchQueue.main.async { SystemSpelling.warmUp() }
         clipboard.start()
         startEngineWhenTrusted()
         observeSelection()
@@ -326,13 +328,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .noWord, .unsupported:
                     return
                 case .word(let token):
+                    // A word KeySwitch changed earlier: put the user's own word back and remember it.
+                    if self.restoreRecentCorrection(in: token) { return }
                     guard let plan = CaretFix.plan(token: token.text, classifier: self.engine.classifier,
                                                    mixed: { self.layouts.repairMixedWord($0, classifier: self.engine.classifier) },
-                                                   flip: { self.layouts.flipText($0) }) else { return }
+                                                   flip: { self.layouts.flipText($0) }) else { NSSound.beep(); return }
                     let selected = token.narrowed(dropFirst: plan.dropFirst, dropLast: plan.dropLast)
                     self.selectedWord = selected
                     let apply: (String) -> Void = { [weak self] choice in
-                        if self?.applySelectionSuggestion(choice) == true { self?.learn(choice, from: plan) }
+                        guard let self, self.applySelectionSuggestion(choice) else { return }
+                        self.learn(choice, from: plan)
+                        // A manual change toggles: the next tap on this word puts the old text back.
+                        let cyrillic = plan.word.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                        self.engine.record(replacement: choice, original: plan.word, lang: cyrillic ? .ru : .en,
+                                           kind: choice == plan.flip ? .layout : .spell, automatic: false)
                     }
                     if plan.choices.count == 1 {
                         apply(plan.choices[0])
@@ -342,6 +351,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+    }
+
+    /// Right ⌥ on a word that KeySwitch replaced in the last minutes restores what was typed.
+    /// For an automatic change the restore is also an exception, so it is not repeated.
+    private func restoreRecentCorrection(in token: SelectedWord) -> Bool {
+        let chars = Array(token.text)
+        let lead = chars.prefix { !$0.isLetter }.count
+        let trail = chars.reversed().prefix { !$0.isLetter }.count
+        guard lead + trail < chars.count else { return false }
+        let core = String(chars[lead..<(chars.count - trail)])
+        guard let correction = engine.recentCorrection(producing: core) else { return false }
+        selectedWord = token.narrowed(dropFirst: lead, dropLast: trail)
+        let switchTo = correction.automatic && correction.kind == .layout ? correction.lang : nil
+        if applySelectionSuggestion(correction.original, switchTo: switchTo) {
+            engine.remember(correction, source: .undo)
+        }
+        return true
     }
 
     private func learn(_ choice: String, from plan: CaretFix.Plan) {
@@ -385,15 +411,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let selected = SelectedWord.capture(), selected.isCurrent() else { return }
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.selectionGeneration == generation else { return }
-                    let choices = SelectionCandidates.make(
+                    var choices = SelectionCandidates.make(
                         for: selected.text, classifier: self.engine.classifier,
                         preferred: self.layouts.currentLang,
                         flip: self.layouts.flipText(selected.text)
                     )
+                    // The word KeySwitch replaced comes first: selecting "беги" offers "баги" back.
+                    let recent = self.engine.recentCorrection(producing: selected.text)
+                    if let recent, recent.original != selected.text {
+                        choices = Array(([recent.original] + choices.filter { $0 != recent.original }).prefix(3))
+                    }
                     guard !choices.isEmpty else { return }
                     self.selectedWord = selected
                     self.selectionPanel.show(options: choices, bounds: selected.bounds) { [weak self] choice in
-                        self?.applySelectionSuggestion(choice)
+                        guard let self else { return }
+                        let restoring = recent.map { $0.original == choice } ?? false
+                        let switchTo = restoring && recent?.automatic == true && recent?.kind == .layout ? recent?.lang : nil
+                        if self.applySelectionSuggestion(choice, switchTo: switchTo), restoring, let recent {
+                            self.engine.remember(recent, source: .undo)
+                        }
                     }
                 }
             }
@@ -506,6 +542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for entry in clipboard.buildItems(target: self, paste: #selector(pasteClip(_:)), pin: #selector(pinClip(_:))) { clipMenu.addItem(entry) }
         clipItem.submenu = clipMenu
         menu.addItem(clipItem)
+        let historyCount = store.corrections.count
+        let history = item("Очистить историю замен (\(historyCount))", #selector(clearCorrectionHistory))
+        history.isEnabled = historyCount > 0
+        menu.addItem(history)
         menu.addItem(.separator())
         let settingsItem = item("Настройки…", #selector(showPreferences))
         settingsItem.keyEquivalent = ","
@@ -513,6 +553,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Как пользоваться…", #selector(showHelp)))
         menu.addItem(ClipboardHistory.header("Исправлено сегодня: \(engine.correctionsToday)"))
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    /// The exceptions you made stay; only the list used to put replaced words back is erased.
+    @objc private func clearCorrectionHistory() {
+        let alert = NSAlert()
+        alert.messageText = "Очистить историю замен?"
+        alert.informativeText = "KeySwitch перестанет узнавать уже заменённые слова, поэтому правый ⌥ не сможет вернуть их исходный вид. Ваши исключения сохранятся."
+        alert.addButton(withTitle: "Очистить")
+        alert.addButton(withTitle: "Отмена")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        store.clearCorrections()
     }
 
     @objc private func showPreferences() { preferences.present() }

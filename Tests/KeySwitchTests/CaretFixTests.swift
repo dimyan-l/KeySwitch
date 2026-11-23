@@ -90,4 +90,12 @@ final class CaretFixTests: XCTestCase {
         XCTAssertEqual(bracketed.choices.first, "хотфикс")
         XCTAssertEqual(bracketed.dropFirst, 0)
     }
+
+    func testKnownWordIsNeverFlippedIntoPunctuation() throws {
+        // "беги" in the other layout is ",tub": that is never what the user wants.
+        XCTAssertNil(CaretFix.plan(token: "беги", classifier: try classifier(), flip: flip))
+        // A known word whose flip is letters still toggles.
+        XCTAssertEqual(try XCTUnwrap(CaretFix.plan(token: "привет", classifier: try classifier(), flip: flip)).choices,
+                       ["ghbdtn"])
+    }
 }

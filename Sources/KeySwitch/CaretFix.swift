@@ -85,8 +85,9 @@ enum CaretFix {
             if choices.isEmpty,
                let fixed = classifier?.spellingInOtherLayout(current: word, alternative: flipped, currentLang: source) {
                 add(fixed)
-            } else {
-                // An explicit request always has the layout flip available, so a second tap flips back.
+            } else if !known || classifier?.models[target]?.isWord(normalizeWord(flipped)) != false {
+                // An explicit request has the layout flip available, so a second tap flips back.
+                // A known word is never turned into punctuation ("беги" → ",tub").
                 add(flipped)
             }
         }

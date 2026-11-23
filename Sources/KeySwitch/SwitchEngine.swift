@@ -34,7 +34,10 @@ final class SwitchEngine {
     private let readFrontmostBundleID: (() -> String?)?
     private let protectedInput: () -> Bool
     private let verifyBackspaceUndo: ((String, pid_t) -> Bool)?
+    /// macOS spell checker veto: a word it accepts is never changed automatically.
+    private let acceptsSpelling: ((String, Lang) -> Bool)?
     private static let maxPendingEvents = 128
+    private static let restoreWindow: TimeInterval = 90
 
     var onSuggestionKey: ((UInt16, CGEventFlags) -> Bool)?
     var onHotkey: ((Hotkey) -> Void)?
@@ -65,6 +68,16 @@ final class SwitchEngine {
     private var rightOptionDirty = false
     private var untrackedToken = false
     private var tapDisables: [TimeInterval] = []
+    private var restoreWatch: RestoreWatch?
+    typealias RecentCorrection = CorrectionRecord
+    /// Every replacement KeySwitch made, newest per word, stored in corrections.json.
+    var recentCorrections: [RecentCorrection] { store.corrections.values.sorted { $0.date < $1.date } }
+
+    /// After an automatic change: the user erases it and types the same original word again.
+    private struct RestoreWatch {
+        let correction: RecentCorrection
+        var erased = 0
+    }
 
     private struct Correction {
         let typedText: String       // what we typed instead
@@ -78,7 +91,8 @@ final class SwitchEngine {
          frontmostPID: @escaping () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier },
          readFrontmostBundleID: (() -> String?)? = nil,
          protectedInput: @escaping () -> Bool = { SecureInput.isEnabled },
-         verifyBackspaceUndo: ((String, pid_t) -> Bool)? = nil) {
+         verifyBackspaceUndo: ((String, pid_t) -> Bool)? = nil,
+         acceptsSpelling: ((String, Lang) -> Bool)? = nil) {
         self.layouts = layouts
         self.store = store
         self.typer = typer
@@ -87,6 +101,7 @@ final class SwitchEngine {
         self.readFrontmostBundleID = readFrontmostBundleID
         self.protectedInput = protectedInput
         self.verifyBackspaceUndo = verifyBackspaceUndo
+        self.acceptsSpelling = acceptsSpelling
     }
 
     // MARK: - Tap lifecycle
@@ -148,6 +163,7 @@ final class SwitchEngine {
         busy = false
         rightOptionDownAt = nil
         rightOptionDirty = false
+        restoreWatch = nil
         resetAll()
     }
 
@@ -168,6 +184,7 @@ final class SwitchEngine {
         busy = false
         rightOptionDownAt = nil
         rightOptionDirty = false
+        restoreWatch = nil
         resetAll()
     }
 
@@ -345,6 +362,10 @@ final class SwitchEngine {
         }
         // Any shortcut or Option-character breaks the word.
         if !flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn]).isEmpty {
+            // Arrows/Home/End arrive with Fn; ⌘ shortcuts can move the caret or edit text.
+            // Either way a retyped word is no longer known to replace the corrected one.
+            // (⌃Space and other layout shortcuts keep the watch.)
+            if flags.contains(.maskCommand) || (115...126).contains(code) { restoreWatch = nil }
             if word.isEmpty && !untrackedToken { resetAll() } else { disregardWord() }
             return pass
         }
@@ -362,6 +383,7 @@ final class SwitchEngine {
         case 51: // Delete (backspace)
             if !flags.contains(.maskShift), event.getIntegerValueField(.keyboardEventAutorepeat) == 0,
                beginBackspaceUndo(event) { return nil }
+            restoreWatch?.erased += 1
             if !word.isEmpty {
                 word.removeLast()
             } else if let p = prev, p.lang == source.lang {
@@ -373,9 +395,11 @@ final class SwitchEngine {
             last = nil
             return pass
         case 48: // Tab can land in an existing word in another field.
+            restoreWatch = nil
             disregardWord()
             return pass
         case 36, 76: // Return can submit a message.
+            restoreWatch = nil
             resetAll()
             return pass
         case 49: // Only a plain space can trigger automatic rewriting.
@@ -390,6 +414,7 @@ final class SwitchEngine {
             resetAll()
             return pass
         default: // arrows, Home/End, forward delete…
+            restoreWatch = nil
             disregardWord()
             return pass
         }
@@ -463,6 +488,21 @@ final class SwitchEngine {
             last = nil
             return false
         }
+        // The user typed this word themselves: an older replacement with the same text is now ambiguous.
+        store.removeCorrection(producing: curStr)
+        if let watch = restoreWatch {
+            restoreWatch = nil
+            let c = watch.correction
+            let typed = classifier.models[curLang]?.core(normalizeWord(curStr)) ?? normalizeWord(curStr)
+            // The user erased the replacement and typed their own word again: respect it from now on.
+            if curLang == c.lang, typed == c.originalWord, watch.erased >= c.replacement.count,
+               Date().timeIntervalSince(c.date) < Self.restoreWindow {
+                remember(c, source: .restore)
+                prev = (strokes, curLang)
+                last = nil
+                return false
+            }
+        }
         let canSwitch = layoutEnabled && altStr.count == strokes.count
         let cautious = mode.isCautious(defaultValue: settings.cautiousMode)
         var contextLang: Lang?
@@ -486,13 +526,17 @@ final class SwitchEngine {
             return false
         }
         let currentCore = classifier.models[curLang]?.core(normalizeWord(plan.currentWord)) ?? normalizeWord(plan.currentWord)
-        let layoutAllowed = canSwitch && plan.decision.convert && !store.rules.blocks(currentCore, lang: curLang, kind: .layout)
+        // Neither dictionary knows the word, but macOS does ("сверю", "задеплою" aside): keep it.
+        let systemKeeps = ["ngram", "other-typo"].contains(plan.decision.reason) && systemAccepts(currentCore, curLang)
+        let layoutAllowed = canSwitch && plan.decision.convert && !systemKeeps
+            && !store.rules.blocks(currentCore, lang: curLang, kind: .layout)
         let needsConfirmation = cautious && !plan.decision.confident
         guard layoutAllowed, !needsConfirmation else {
             if canSpell, curStr.count == strokes.count,
                let model = classifier.models[curLang],
                let fix = AutomaticCorrection.spelling(current: curStr, alternative: altStr, model: model,
-                                                       other: classifier.models[target], rules: store.rules) {
+                                                       other: classifier.models[target], rules: store.rules),
+               fix.kind != .spell || !systemAccepts(fix.word, curLang) {
                 return applySpellingCorrection(original: curStr, replacement: fix.text,
                                                language: curLang, kind: fix.kind, word: fix.word)
             }
@@ -534,6 +578,8 @@ final class SwitchEngine {
 
         last = Correction(typedText: newText, originalText: originalText,
                           from: curLang, originalWord: currentCore, kind: .layout)
+        record(replacement: plan.alternativeWord, original: plan.currentWord, lang: curLang,
+               originalWord: currentCore, kind: .layout, watchRestore: true)
         prev = plan.alternativeWord == altStr ? (strokes, target) : nil
         return true
     }
@@ -548,8 +594,42 @@ final class SwitchEngine {
         }
         last = Correction(typedText: replacement, originalText: original, from: language,
                           originalWord: word ?? normalizeWord(original), kind: kind)
+        record(replacement: replacement, original: original, lang: language,
+               originalWord: word ?? normalizeWord(original), kind: kind, watchRestore: true)
         prev = nil
         return true
+    }
+
+    // MARK: - Recent corrections
+
+    private func systemAccepts(_ word: String, _ lang: Lang) -> Bool {
+        // Short tokens are often abbreviations the checker knows ("nj", "ds"): too weak a signal.
+        guard word.count >= 4, let acceptsSpelling else { return false }
+        return acceptsSpelling(word, lang)
+    }
+
+    /// Remembers a replacement so a later return to the word can revert it.
+    func record(replacement: String, original: String, lang: Lang, originalWord: String? = nil,
+                kind: FixKind, automatic: Bool = true, watchRestore: Bool = false) {
+        guard replacement != original, !replacement.isEmpty, !original.isEmpty else { return }
+        let entry = RecentCorrection(replacement: replacement, original: original, lang: lang,
+                                     originalWord: originalWord ?? normalizeWord(original),
+                                     kind: kind, automatic: automatic, date: Date())
+        store.recordCorrection(entry)
+        restoreWatch = watchRestore ? RestoreWatch(correction: entry) : nil
+    }
+
+    /// The most recent replacement that produced `text` (case and ё-insensitive).
+    func recentCorrection(producing text: String) -> RecentCorrection? {
+        store.correction(producing: text)
+    }
+
+    /// The user reverted `c`: forget it and, for an automatic change, never repeat it.
+    func remember(_ c: RecentCorrection, source: RuleSource) {
+        if store.correction(producing: c.replacement) == c { store.removeCorrection(producing: c.replacement) }
+        if case .some(let watch) = restoreWatch, watch.correction == c { restoreWatch = nil }
+        guard c.automatic else { return }
+        store.addRule(c.originalWord, lang: c.lang, kind: c.kind, result: c.replacement, source: source)
     }
 
     private func replacementActions(original: String, replacement: String) -> [Typer.Action] {
@@ -708,8 +788,15 @@ final class SwitchEngine {
         if let c = last {
             last = nil
             let actions: [Typer.Action] = [.backspace(c.typedText.count + 1), .text(c.originalText), .key(49, [])]
+            restoreWatch = nil
             perform(actions, switchingTo: c.kind == .layout ? c.from : nil) { [weak self] in
                 guard let self else { return }
+                // The history keys words without edge punctuation ("привет." → "привет").
+                let lastWord = c.typedText.split(separator: " ").last.map(String.init) ?? c.typedText
+                let core = lastWord.trimmingCharacters(in: CharacterSet.letters.inverted)
+                if let r = self.store.correction(producing: core), r.originalWord == c.originalWord {
+                    self.store.removeCorrection(producing: r.replacement)
+                }
                 self.store.addRule(c.originalWord, lang: c.from, kind: c.kind,
                                    result: c.typedText, source: .undo)
             }
