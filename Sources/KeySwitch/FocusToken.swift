@@ -51,6 +51,33 @@ struct FocusToken {
         return !SecureInput.isEnabled && isCurrent()
     }
 
+    /// True when the caret sits between words: nothing or a space/punctuation before it and
+    /// nothing or a space after it (an empty chat field, the end of a line). Nil when unreadable.
+    func caretIsAtWordBoundary() -> Bool? {
+        AXUIElementSetMessagingTimeout(element, 0.04)
+        guard canReadText, let caret = selectionRange(), caret.length == 0, caret.location >= 0 else { return nil }
+        var countValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &countValue) == .success,
+              let count = (countValue as? NSNumber)?.intValue, caret.location <= count else { return nil }
+        func character(at location: Int) -> Character? {
+            var range = CFRange(location: location, length: 1)
+            guard let value = AXValueCreate(.cfRange, &range) else { return nil }
+            var text: CFTypeRef?
+            guard AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
+                                                             value, &text) == .success else { return nil }
+            return (text as? String)?.first
+        }
+        if caret.location > 0 {
+            guard let before = character(at: caret.location - 1) else { return nil }
+            if before.isLetter || before.isNumber || before == "'" || before == "-" { return false }
+        }
+        if caret.location < count {
+            guard let after = character(at: caret.location) else { return nil }
+            if !after.isWhitespace && !after.isNewline { return false }
+        }
+        return isCurrent()
+    }
+
     private func selectionRange() -> CFRange? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,

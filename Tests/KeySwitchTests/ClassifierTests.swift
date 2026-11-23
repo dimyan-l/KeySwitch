@@ -235,4 +235,36 @@ final class ClassifierTests: XCTestCase {
         XCTAssertFalse(WordForms.hasKnownSiblings("свеклп", model: model))
         XCTAssertFalse(WordForms.hasKnownSiblings("hello", model: LanguageModel(lang: .en)))
     }
+
+    func testRareDictionaryJunkInWrongLayoutIsFixedEvenInCautiousMode() throws {
+        let c = try classifier()
+        for (typed, lang) in [("nfr", Lang.en), ("dct", .en), ("ghb", .en), ("nen", .en), ("ntv", .en),
+                              (",sk", .en), ("'nj", .en), ("vj.", .en), (",.hj", .en)] {
+            let d = c.decide(current: typed, alternative: SelfTest.flip(typed, to: lang.other), currentLang: lang)
+            XCTAssertTrue(d.convert && d.confident, typed)
+        }
+        // Two-letter tokens stay a suggestion: "шт" is an abbreviation, not "in".
+        for (typed, lang) in [("шт", Lang.ru), ("ns", .en)] {
+            let d = c.decide(current: typed, alternative: SelfTest.flip(typed, to: lang.other), currentLang: lang)
+            XCTAssertFalse(d.confident, typed)
+        }
+        // Common words in either language are never flipped.
+        for (typed, lang) in [("the", Lang.en), ("так", .ru), ("hello", .en)] {
+            XCTAssertFalse(c.decide(current: typed, alternative: SelfTest.flip(typed, to: lang.other), currentLang: lang).convert, typed)
+        }
+    }
+
+    func testDotThatSpellsYuIsNotAnIdentifier() throws {
+        let c = try classifier()
+        for (typed, expected) in [("cktle.obq", "следующий"), ("pfdtle.obq", "заведующий")] {
+            let plan = c.plan(current: typed, alternative: SelfTest.flip(typed, to: .ru), currentLang: .en)
+            XCTAssertEqual(plan.alternativeWord, expected)
+            XCTAssertFalse(InputPolicy.blocksAutomaticCorrection(typed, plan: plan), typed)
+        }
+        // Domains and code identifiers stay untouched.
+        for typed in ["b.kz", "object.method", "file.swift"] {
+            let plan = c.plan(current: typed, alternative: SelfTest.flip(typed, to: .ru), currentLang: .en)
+            XCTAssertTrue(!plan.decision.convert || InputPolicy.blocksAutomaticCorrection(typed, plan: plan), typed)
+        }
+    }
 }

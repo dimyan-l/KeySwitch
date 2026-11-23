@@ -10,6 +10,8 @@ enum Lang: String, CaseIterable, Codable {
 /// Thresholds calibrated on frequency lists (see tools/classifier.py).
 enum Thresholds {
     static let freqMargin: Float = 2.0      // both readings are real words: other must be 100x more frequent
+    static let clearFreqMargin: Float = 2.5 // ...and ~300x more frequent than a rare token is a sure slip ("nfr" → "так")
+    static let rareScore: Float = 3.5       // below this a dictionary "word" is usually an abbreviation or layout junk
     static let ngramMargin: Float = 0.6     // neither reading is in a dictionary: avg log-prob gap per char
     static let ngramFloor: Float = -3.3     // the other reading must look at least this "word-like"
     static let minNgramLength = 3
@@ -213,7 +215,17 @@ final class Classifier {
             return Decision(convert: true, reason: "other-dict")
         case let (.some(c), .some(o)):
             let favorsOther = o - c >= freqMargin
-            return Decision(convert: favorsOther, reason: favorsOther ? "freq" : "both-dict", confident: false)
+            // The frequency lists carry layout junk typed by others ("nfr" = "так", "dct" = "все").
+            // A rare 3+ letter token whose other reading is a very common word is not ambiguous.
+            // Length is the other reading's: in ",sk" = "был" the comma is a letter key.
+            // A typed token that needs punctuation to spell the other word is not an English word
+            // at all ("'nj" = "это"), so the plain 100x margin is enough there.
+            let punctuationSpellsWord = curNormalized.contains { !cur.letters.contains($0) }
+                && wo.count == normalizeWord(alternative).count
+            let clear = favorsOther && wo.count >= 3
+                && ((o - c >= Thresholds.clearFreqMargin && c < Thresholds.rareScore)
+                    || (punctuationSpellsWord && c < Thresholds.rareScore + 0.5))
+            return Decision(convert: favorsOther, reason: favorsOther ? "freq" : "both-dict", confident: clear)
         case (.none, .none):
             guard wo.count >= Thresholds.minNgramLength else {
                 return Decision(convert: false, reason: "short")

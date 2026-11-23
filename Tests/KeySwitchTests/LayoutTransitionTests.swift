@@ -150,7 +150,7 @@ final class LayoutTransitionTests: XCTestCase {
         engine.classifier = Classifier(models: [.en: english, .ru: russian])
         let wrongKeys: [UInt16] = [5, 4, 11, 2, 17, 45] // ghbdtn
 
-        for delimiter: UInt16 in [36, 48, 49] {
+        for delimiter: UInt16 in [48, 49] {
             for code in wrongKeys {
                 XCTAssertTrue(passes(key(code), through: engine))
                 XCTAssertFalse(engine.isTyping)
@@ -392,5 +392,124 @@ final class LayoutTransitionTests: XCTestCase {
         second.clearCorrections()
         second.flushPendingWrites()
         XCTAssertTrue(UserStore(directory: directory, bundledRulesURL: nil).corrections.isEmpty)
+    }
+
+    func testCautiousModePullsAShortWrongLayoutWordAlongWithAConfidentFix() throws {
+        let (en, ru) = try sources()
+        var current = en
+        let layouts = KeyboardLayouts(sources: [.en: en, .ru: ru], readSource: { current }, requestSource: { _ in
+            current = ru
+            return noErr
+        })
+        var posted: [CGEvent] = []
+        let typer = Typer(queue: DispatchQueue(label: "test.cautious-retro"), eventSink: { posted.append($0.copy()!) })
+        let engine = engine(layouts: layouts, typer: typer)
+        let english = LanguageModel(lang: .en)
+        english.add("vs", score: 3.0)
+        english.add("my", score: 7.0)
+        let russian = LanguageModel(lang: .ru)
+        russian.add("мы", score: 6.9)
+        russian.add("привет", score: 8)
+        engine.classifier = Classifier(models: [.en: english, .ru: russian])
+
+        for code: UInt16 in [9, 1] { XCTAssertTrue(passes(key(code), through: engine)) } // vs
+        XCTAssertTrue(passes(key(49), through: engine), "a two-letter word alone stays a suggestion")
+        for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) } // ghbdtn
+        XCTAssertFalse(passes(key(49), through: engine))
+        let done = expectation(description: "rewrite finished")
+        engine.afterTyping { done.fulfill() }
+        wait(for: [done], timeout: 2)
+        let downs = posted.filter { $0.type == .keyDown }
+        XCTAssertEqual(downs.filter { $0.getIntegerValueField(.keyboardEventKeycode) == 51 }.count, 9)
+        let typed = downs.filter { $0.getIntegerValueField(.keyboardEventKeycode) != 51 }.map(text).joined()
+        XCTAssertTrue(typed.hasPrefix("мы привет"), typed)
+    }
+
+    func testReturnFixesLayoutBeforeSendingButNeverTypos() throws {
+        let (en, ru) = try sources()
+        for shift in [false, true] {
+            var current = en
+            let layouts = KeyboardLayouts(sources: [.en: en, .ru: ru], readSource: { current }, requestSource: { _ in
+                current = ru
+                return noErr
+            })
+            var posted: [CGEvent] = []
+            let typer = Typer(queue: DispatchQueue(label: "test.return-\(shift)"), eventSink: { posted.append($0.copy()!) })
+            let engine = engine(layouts: layouts, typer: typer, settings: { $0.spellEnabled = true })
+            let english = LanguageModel(lang: .en)
+            english.add("address", score: 8)
+            let russian = LanguageModel(lang: .ru)
+            russian.add("тут", score: 6)
+            engine.classifier = Classifier(models: [.en: english, .ru: russian])
+
+            for code: UInt16 in [45, 14, 45] { XCTAssertTrue(passes(key(code), through: engine)) } // nen
+            let enter = key(36, text: "\r")
+            if shift { enter.flags = .maskShift }
+            XCTAssertFalse(passes(enter, through: engine), "Return waits for the layout fix")
+            let done = expectation(description: "rewrite and Return posted")
+            engine.afterTyping { done.fulfill() }
+            wait(for: [done], timeout: 2)
+            let downs = posted.filter { $0.type == .keyDown }
+            XCTAssertEqual(downs.filter { $0.getIntegerValueField(.keyboardEventKeycode) == 51 }.count, 3)
+            XCTAssertEqual(downs.filter { ![51, 36].contains($0.getIntegerValueField(.keyboardEventKeycode)) }.map(text).joined(), "тут")
+            let sentReturn = try XCTUnwrap(downs.last)
+            XCTAssertEqual(sentReturn.getIntegerValueField(.keyboardEventKeycode), 36, "Return comes after the fix")
+            XCTAssertEqual(sentReturn.flags.contains(.maskShift), shift)
+
+            // A typo before Return is sent as typed.
+            current = en
+            _ = engine.inputSourceDidChange(to: en.id)
+            for code: UInt16 in [0, 2, 15, 14, 1, 1] { XCTAssertTrue(passes(key(code), through: engine)) } // adress
+            XCTAssertTrue(passes(key(36, text: "\r"), through: engine))
+        }
+    }
+
+    private func wrongLayoutEngine(_ words: [String]) throws -> SwitchEngine {
+        let (en, ru) = try sources()
+        var current = en
+        let layouts = KeyboardLayouts(sources: [.en: en, .ru: ru], readSource: { current }, requestSource: { _ in
+            current = ru
+            return noErr
+        })
+        let engine = engine(layouts: layouts)
+        let russian = LanguageModel(lang: .ru)
+        for word in words { russian.add(word, score: 7) }
+        engine.classifier = Classifier(models: [.en: LanguageModel(lang: .en), .ru: russian])
+        return engine
+    }
+
+    func testClickAtAWordBoundaryTracksTheNextWord() throws {
+        let engine = try wrongLayoutEngine(["привет"])
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        engine.caretVerifiedAtBoundary(clickRevision: engine.clickRevision)
+        for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine), "an empty chat field: the first word is fixed")
+    }
+
+    func testClickConfirmedTooLateOrMidWordLeavesTheWordAlone() throws {
+        let engine = try wrongLayoutEngine(["привет"])
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        let revision = engine.clickRevision
+        XCTAssertTrue(passes(key(5), through: engine))
+        engine.caretVerifiedAtBoundary(clickRevision: revision) // arrives after the first key: ignored
+        for code: UInt16 in [4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine))
+        // A stale confirmation from an older click is ignored too.
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        engine.caretVerifiedAtBoundary(clickRevision: revision)
+        for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine))
+    }
+
+    func testDeadApostropheOfUSInternationalKeepsTheWord() throws {
+        let engine = try wrongLayoutEngine(["это"])
+        // U.S. International: "'" is a dead key (no text), the next key delivers "'n".
+        XCTAssertTrue(passes(key(39, text: ""), through: engine))
+        XCTAssertTrue(passes(key(45, text: "'n"), through: engine))
+        XCTAssertTrue(passes(key(38, text: "j"), through: engine))
+        XCTAssertEqual(engine.trackedWordLength, 3)
+        XCTAssertFalse(passes(key(49, text: " "), through: engine), "'nj is это")
     }
 }

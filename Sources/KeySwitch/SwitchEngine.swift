@@ -69,6 +69,11 @@ final class SwitchEngine {
     private var untrackedToken = false
     private var tapDisables: [TimeInterval] = []
     private var restoreWatch: RestoreWatch?
+    /// Mouse clicks and keys since the last one: a click is trusted only if no key came after it.
+    private(set) var clickRevision: UInt64 = 0
+    private var keysSinceClick = 0
+    /// A dead key ("'" on U.S. International) arrives with no text; the next key carries both.
+    private var pendingDeadKey: String?
     typealias RecentCorrection = CorrectionRecord
     /// Every replacement KeySwitch made, newest per word, stored in corrections.json.
     var recentCorrections: [RecentCorrection] { store.corrections.values.sorted { $0.date < $1.date } }
@@ -198,6 +203,7 @@ final class SwitchEngine {
         }
         guard layouts.observeInputSource(id) else { return false }
         let hadUnfinishedWord = untrackedToken || !word.isEmpty
+        KeyboardDiagnostics.decision(.wordDropped, "external-source-change unfinished=\(hadUnfinishedWord) busy=\(busy)")
         if busy {
             // Keep physical keys already held for this process. Cancel the edit and let
             // its completion release them, without trying to select the old layout.
@@ -243,6 +249,10 @@ final class SwitchEngine {
             return pass
         }
         if event.getIntegerValueField(.eventSourceUserData) == Typer.marker { return pass }
+        if type == .keyDown, [36, 76, 49].contains(event.getIntegerValueField(.keyboardEventKeycode)) {
+            let mods = event.flags.intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn])
+            KeyboardDiagnostics.decision(.wordFinished, "terminator=\(event.getIntegerValueField(.keyboardEventKeycode)) word=\(word.count) untracked=\(untrackedToken) busy=\(busy) secure=\(protectedInput()) excluded=\(settings.isExcluded(frontmostBundleID)) app=\(frontmostBundleID ?? "nil") lang=\(layouts.current().lang?.rawValue ?? "nil") mods=\(String(mods.rawValue, radix: 16))")
+        }
         if protectedInput() {
             if busy || !word.isEmpty || prev != nil || last != nil || rightOptionDownAt != nil {
                 cancelPendingTyping()
@@ -252,6 +262,8 @@ final class SwitchEngine {
         if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) {
             cancelPendingTyping()
             disregardWord()
+            clickRevision &+= 1
+            keysSinceClick = 0
             return pass
         }
         if let readFrontmostBundleID {
@@ -303,8 +315,11 @@ final class SwitchEngine {
             return pass
         case .keyDown:
             contextRevision &+= 1
+            keysSinceClick += 1
             typer.cancel()
-            return handleKeyDown(event)
+            let deadKey = pendingDeadKey
+            pendingDeadKey = nil
+            return handleKeyDown(event, afterDeadKey: deadKey)
         case .keyUp:
             // The terminator's key-up follows its swallowed key-down. It must not cancel a fix.
             return pass
@@ -339,7 +354,15 @@ final class SwitchEngine {
         }
     }
 
-    private func handleKeyDown(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+    /// A click put the caret between words (checked through Accessibility after the click):
+    /// the next word is a new word, so track it as if the user had typed a space.
+    func caretVerifiedAtBoundary(clickRevision revision: UInt64) {
+        guard revision == clickRevision, keysSinceClick == 0, word.isEmpty, untrackedToken, !busy else { return }
+        KeyboardDiagnostics.decision(.wordFinished, "click at word boundary")
+        resetAll()
+    }
+
+    private func handleKeyDown(_ event: CGEvent, afterDeadKey deadKey: String? = nil) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
@@ -398,12 +421,25 @@ final class SwitchEngine {
             restoreWatch = nil
             disregardWord()
             return pass
-        case 36, 76: // Return can submit a message.
+        case 36, 76: // Return (and Shift+Return): fix the word's layout first, then send Return itself.
+            // Typos are never fixed here: Return can submit a message with an unchecked replacement.
+            guard !untrackedToken, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else {
+                if untrackedToken { KeyboardDiagnostics.decision(.wordDropped, "return untracked") }
+                restoreWatch = nil
+                resetAll()
+                return pass
+            }
+            let fixed = finishWord(source: source, terminator: .key(code, flags.intersection(.maskShift)),
+                                   allowSpelling: InputPolicy.allowsAutomaticSpelling(terminator: code))
+            // After Return the text may be sent: no retype-undo and no context from the previous line.
             restoreWatch = nil
             resetAll()
-            return pass
+            return fixed ? nil : pass
         case 49: // Only a plain space can trigger automatic rewriting.
-            if untrackedToken || flags.contains(.maskShift) { resetAll(); return pass }
+            if untrackedToken || flags.contains(.maskShift) {
+                if untrackedToken { KeyboardDiagnostics.decision(.wordDropped, "space untracked") }
+                resetAll(); return pass
+            }
             return finishWord(source: source) ? nil : pass
         case 65...92: // A keypad digit/operator may be part of a single token.
             disregardWord()
@@ -424,7 +460,14 @@ final class SwitchEngine {
         let current = layouts.character(stroke, layout: source.layout)
         let alternative = layouts.character(stroke, in: language.other)
         let delivered = Self.unicodeText(of: event)
-        guard current.count == 1, delivered.isEmpty || delivered == current else {
+        // After a dead key the text holds both characters ("'" + "n" = "'n"); an accented
+        // composition ("'" + "e" = "é") is not the key's letter and drops the word as before.
+        let composedWithDeadKey = deadKey.map { delivered == $0 + current } ?? false
+        if delivered.isEmpty, current.count == 1, current.first?.isLetter == false, !untrackedToken {
+            pendingDeadKey = current
+        }
+        guard current.count == 1, delivered.isEmpty || delivered == current || composedWithDeadKey else {
+            KeyboardDiagnostics.decision(.wordDropped, current.count == 1 ? "char-mismatch" : "no-char")
             disregardWord()
             return pass
         }
@@ -457,7 +500,8 @@ final class SwitchEngine {
     }
 
     /// Returns true when the terminator key is swallowed (we retype it ourselves after the fix).
-    private func finishWord(source: KeyboardLayouts.Source) -> Bool {
+    private func finishWord(source: KeyboardLayouts.Source, terminator: Typer.Action = .key(49, []),
+                            allowSpelling: Bool = true) -> Bool {
         let strokes = word
         word = []
         guard !strokes.isEmpty else {
@@ -467,6 +511,7 @@ final class SwitchEngine {
         }
         // Keep one correction bounded even if a field contains a very long token.
         guard strokes.count <= InputPolicy.maxAutomaticWordLength, frontmostPID() != nil else {
+            KeyboardDiagnostics.decision(.wordFinished, "skip long-or-no-app")
             prev = nil
             last = nil
             return false
@@ -474,8 +519,9 @@ final class SwitchEngine {
         let cur = source
         let mode = settings.applicationMode(for: frontmostBundleID)
         let layoutEnabled = mode.allowsAutomatic && settings.autoEnabled && layouts.hasBothLayouts
-        let canSpell = mode.allowsAutomatic && settings.spellEnabled
+        let canSpell = mode.allowsAutomatic && settings.spellEnabled && allowSpelling
         guard layoutEnabled || canSpell, let classifier, let curLang = cur.lang else {
+            KeyboardDiagnostics.decision(.wordFinished, "skip disabled layout=\(layoutEnabled) classifier=\(classifier != nil)")
             if let l = cur.lang { prev = (strokes, l) }
             last = nil
             return false
@@ -484,6 +530,7 @@ final class SwitchEngine {
         let curStr = layouts.string(strokes, layout: cur.layout)
         let altStr = layouts.string(strokes, in: target)
         guard curStr.count == strokes.count else {
+            KeyboardDiagnostics.decision(.wordFinished, "skip length")
             prev = nil
             last = nil
             return false
@@ -497,6 +544,7 @@ final class SwitchEngine {
             // The user erased the replacement and typed their own word again: respect it from now on.
             if curLang == c.lang, typed == c.originalWord, watch.erased >= c.replacement.count,
                Date().timeIntervalSince(c.date) < Self.restoreWindow {
+                KeyboardDiagnostics.decision(.wordFinished, "restore")
                 remember(c, source: .restore)
                 prev = (strokes, curLang)
                 last = nil
@@ -521,16 +569,18 @@ final class SwitchEngine {
             plan = fixed
         }
         if InputPolicy.blocksAutomaticCorrection(curStr, plan: plan) {
+            KeyboardDiagnostics.decision(.wordFinished, "blocked \(plan.decision.reason)")
             prev = nil
             last = nil
             return false
         }
         let currentCore = classifier.models[curLang]?.core(normalizeWord(plan.currentWord)) ?? normalizeWord(plan.currentWord)
         // Neither dictionary knows the word, but macOS does ("сверю", "задеплою" aside): keep it.
-        let systemKeeps = ["ngram", "other-typo"].contains(plan.decision.reason) && systemAccepts(currentCore, curLang)
+        let systemKeeps = ["ngram", "other-typo", "freq"].contains(plan.decision.reason) && systemAccepts(currentCore, curLang)
         let layoutAllowed = canSwitch && plan.decision.convert && !systemKeeps
             && !store.rules.blocks(currentCore, lang: curLang, kind: .layout)
         let needsConfirmation = cautious && !plan.decision.confident
+        KeyboardDiagnostics.decision(.wordFinished, "\(layoutAllowed && !needsConfirmation ? "fix" : "keep") reason=\(plan.decision.reason) convert=\(plan.decision.convert) confident=\(plan.decision.confident) cautious=\(cautious) system=\(systemKeeps) canSwitch=\(canSwitch)")
         guard layoutAllowed, !needsConfirmation else {
             if canSpell, curStr.count == strokes.count,
                let model = classifier.models[curLang],
@@ -557,19 +607,22 @@ final class SwitchEngine {
         // Pull a previous word along ("z ghbdtn." -> "я привет.", "dj dctv" -> "во всем").
         var newText = plan.prefix + plan.alternativeWord + plan.suffix
         var originalText = curStr
-        if !cautious, plan.prefix.isEmpty, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
+        if plan.prefix.isEmpty, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
             let pc = layouts.string(p.strokes, layout: cur.layout)
             let pa = layouts.string(p.strokes, in: target)
+            // Cautious mode pulls a short word along ("ns uhe,sq" → "ты группа") only when the
+            // classifier converts it on its own; the confident fix of this word removes the doubt.
             if pc.count == p.strokes.count, pa.count == p.strokes.count,
                !store.rules.blocks(pc, lang: curLang, kind: .layout),
-               classifier.shouldRetroFix(current: pc, alternative: pa, currentLang: curLang) {
+               cautious ? classifier.decide(current: pc, alternative: pa, currentLang: curLang).convert
+                        : classifier.shouldRetroFix(current: pc, alternative: pa, currentLang: curLang) {
                 newText = pa + " " + plan.alternativeWord + plan.suffix
                 originalText = pc + " " + curStr
             }
         }
 
         var actions = replacementActions(original: originalText, replacement: newText)
-        actions.append(.key(49, []))
+        actions.append(terminator)
         perform(actions, switchingTo: target) { [weak self] in
             guard let self, self.isRunning else { return }
             self.bumpStats()

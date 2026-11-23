@@ -382,6 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let down { selectionMonitors.append(down) }
         let up = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: { [weak self] _ in
             self?.scheduleSelectionSuggestions()
+            self?.checkCaretAfterClick()
         })
         if let up { selectionMonitors.append(up) }
         let keyUp = NSEvent.addGlobalMonitorForEvents(matching: [.keyUp], handler: { [weak self] event in
@@ -391,6 +392,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         })
         if let keyUp { selectionMonitors.append(keyUp) }
+    }
+
+    /// A click usually lands in an empty field or after the last word (a chat box). Ask the
+    /// editor whether the caret is between words, so the first word is checked like any other.
+    private func checkCaretAfterClick() {
+        guard engine.isRunning, !SecureInput.isEnabled, !settings.isExcluded(engine.frontmostBundleID) else { return }
+        let revision = engine.clickRevision
+        // The global monitor sees mouse-up before the editor has moved its caret: reading at once
+        // returns the old position. A short delay is still well before the first keystroke.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard FocusToken.capture()?.caretIsAtWordBoundary() == true else { return }
+            DispatchQueue.main.async { self?.engine.caretVerifiedAtBoundary(clickRevision: revision) }
+        }
     }
 
     private func dismissSelectionSuggestions() {
