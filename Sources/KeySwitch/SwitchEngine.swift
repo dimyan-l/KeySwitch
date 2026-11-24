@@ -72,6 +72,9 @@ final class SwitchEngine {
     /// Mouse clicks and keys since the last one: a click is trusted only if no key came after it.
     private(set) var clickRevision: UInt64 = 0
     private var keysSinceClick = 0
+    /// The field after a click could not tell where its caret is (Electron, some web views):
+    /// the first word is tracked, but only a confident whole-word layout fix is applied.
+    private var clickUnverified = false
     /// A dead key ("'" on U.S. International) arrives with no text; the next key carries both.
     private var pendingDeadKey: String?
     typealias RecentCorrection = CorrectionRecord
@@ -177,6 +180,7 @@ final class SwitchEngine {
         prev = nil
         last = nil
         untrackedToken = false
+        clickUnverified = false
     }
 
     func cancelPendingTyping() {
@@ -362,6 +366,15 @@ final class SwitchEngine {
         resetAll()
     }
 
+    /// Accessibility could not read the caret after a click (no answer, not "mid-word").
+    /// Usually an empty chat box in an Electron app: track the first word cautiously.
+    func caretUnreadableAfterClick(clickRevision revision: UInt64) {
+        guard revision == clickRevision, keysSinceClick == 0, word.isEmpty, untrackedToken, !busy else { return }
+        KeyboardDiagnostics.decision(.wordFinished, "click caret unreadable")
+        resetAll()
+        clickUnverified = true
+    }
+
     private func handleKeyDown(_ event: CGEvent, afterDeadKey deadKey: String? = nil) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
@@ -504,6 +517,8 @@ final class SwitchEngine {
                             allowSpelling: Bool = true) -> Bool {
         let strokes = word
         word = []
+        let afterUnverifiedClick = clickUnverified
+        clickUnverified = false
         guard !strokes.isEmpty else {
             prev = nil
             last = nil
@@ -519,7 +534,8 @@ final class SwitchEngine {
         let cur = source
         let mode = settings.applicationMode(for: frontmostBundleID)
         let layoutEnabled = mode.allowsAutomatic && settings.autoEnabled && layouts.hasBothLayouts
-        let canSpell = mode.allowsAutomatic && settings.spellEnabled && allowSpelling
+        // A word started after an unreadable click may be the tail of an existing word: no typo fixes.
+        let canSpell = mode.allowsAutomatic && settings.spellEnabled && allowSpelling && !afterUnverifiedClick
         guard layoutEnabled || canSpell, let classifier, let curLang = cur.lang else {
             KeyboardDiagnostics.decision(.wordFinished, "skip disabled layout=\(layoutEnabled) classifier=\(classifier != nil)")
             if let l = cur.lang { prev = (strokes, l) }
@@ -579,7 +595,8 @@ final class SwitchEngine {
         let systemKeeps = ["ngram", "other-typo", "freq"].contains(plan.decision.reason) && systemAccepts(currentCore, curLang)
         let layoutAllowed = canSwitch && plan.decision.convert && !systemKeeps
             && !store.rules.blocks(currentCore, lang: curLang, kind: .layout)
-        let needsConfirmation = cautious && !plan.decision.confident
+        let needsConfirmation = (cautious && !plan.decision.confident)
+            || (afterUnverifiedClick && (!plan.decision.confident || plan.currentWord.count < 3))
         KeyboardDiagnostics.decision(.wordFinished, "\(layoutAllowed && !needsConfirmation ? "fix" : "keep") reason=\(plan.decision.reason) convert=\(plan.decision.convert) confident=\(plan.decision.confident) cautious=\(cautious) system=\(systemKeeps) canSwitch=\(canSwitch)")
         guard layoutAllowed, !needsConfirmation else {
             if canSpell, curStr.count == strokes.count,
