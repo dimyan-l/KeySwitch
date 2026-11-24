@@ -103,7 +103,7 @@ final class LayoutTransitionTests: XCTestCase {
         let engine = engine(layouts: layouts, typer: typer)
 
         engine.perform([], switchingTo: .ru)
-        XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
+        XCTAssertFalse(passes(key(0, text: "a"), through: engine))
         wait(for: [requested], timeout: 2)
         XCTAssertTrue(engine.isTyping, "A successful request does not prove the source is active")
         current = ru
@@ -128,7 +128,7 @@ final class LayoutTransitionTests: XCTestCase {
         let engine = engine(layouts: layouts, typer: typer)
 
         engine.perform([], switchingTo: .ru)
-        XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
+        XCTAssertFalse(passes(key(0, text: "a"), through: engine))
         wait(for: [released], timeout: 2)
         XCTAssertEqual(requests, 1)
         XCTAssertFalse(engine.isTyping)
