@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AnyView(ApplicationProfilesView(model: model))
     }
     private var selectionMonitors: [Any] = []
+    /// Processes already asked to expose their web accessibility tree (main thread only).
+    private var webContentRequested: Set<pid_t> = []
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private var selectionGeneration: UInt64 = 0
     private var selectedWord: SelectedWord?
@@ -402,8 +404,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The global monitor sees mouse-up before the editor has moved its caret: reading at once
         // returns the old position. A short delay is still well before the first keystroke.
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard FocusToken.capture()?.caretIsAtWordBoundary() == true else { return }
-            DispatchQueue.main.async { self?.engine.caretVerifiedAtBoundary(clickRevision: revision) }
+            let token = FocusToken.capture()
+            let atBoundary = token?.caretIsAtWordBoundary()
+            let pid = token?.pid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch atBoundary {
+                case true?:
+                    self.engine.caretVerifiedAtBoundary(clickRevision: revision)
+                case false?:
+                    break // the caret is inside a word: leave the next keys alone
+                case nil:
+                    // Unreadable is not "mid-word": an Electron chat box hides its field until
+                    // asked. Ask once per process so later clicks can be checked precisely.
+                    self.engine.caretUnreadableAfterClick(clickRevision: revision)
+                    if let pid, self.webContentRequested.insert(pid).inserted {
+                        DispatchQueue.global(qos: .utility).async { FocusToken.exposeWebContent(pid: pid) }
+                    }
+                }
+            }
         }
     }
 

@@ -24,6 +24,12 @@ final class LayoutTransitionTests: XCTestCase {
         return event
     }
 
+    /// `handle` returns the event unretained: compare it while the event is still alive.
+    /// Asserting on the result itself let XCTest print an already released CGEvent (signal 11).
+    private func passes(_ event: CGEvent, through engine: SwitchEngine) -> Bool {
+        engine.handle(type: .keyDown, event: event) != nil
+    }
+
     private func engine(layouts: KeyboardLayouts, typer: Typer, frontmostPID: @escaping () -> pid_t? = { 123 },
                         protectedInput: @escaping () -> Bool = { false }) -> SwitchEngine {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -56,11 +62,11 @@ final class LayoutTransitionTests: XCTestCase {
         }))
 
         for code: UInt16 in [4, 31, 37, 0] { // hola
-            XCTAssertNotNil(engine.handle(type: .keyDown, event: key(code)))
+            XCTAssertTrue(passes(key(code), through: engine))
             XCTAssertFalse(engine.isTyping)
             XCTAssertEqual(current.id, en.id)
         }
-        XCTAssertNil(engine.handle(type: .keyDown, event: key(49)))
+        XCTAssertFalse(passes(key(49), through: engine))
         wait(for: [selected], timeout: 2)
         XCTAssertEqual(posted, [49, 49])
         XCTAssertEqual(current.id, es.id)
@@ -71,13 +77,13 @@ final class LayoutTransitionTests: XCTestCase {
         let layouts = layouts(readSource: { current })
         let engine = engine(layouts: layouts, typer: Typer(eventSink: { _ in XCTFail("Must not rewrite an unfinished word") }))
 
-        XCTAssertNotNil(engine.handle(type: .keyDown, event: key(45, text: "n")))
+        XCTAssertTrue(passes(key(45, text: "n"), through: engine))
         XCTAssertEqual(engine.trackedWordLength, 1)
         current = es
-        XCTAssertNotNil(engine.handle(type: .keyDown, event: key(41, text: "ñ")))
+        XCTAssertTrue(passes(key(41, text: "ñ"), through: engine))
         XCTAssertEqual(engine.trackedWordLength, 0)
-        XCTAssertNotNil(engine.handle(type: .keyDown, event: key(49)))
-        XCTAssertNotNil(engine.handle(type: .keyDown, event: key(41, text: "ñ")))
+        XCTAssertTrue(passes(key(49), through: engine))
+        XCTAssertTrue(passes(key(41, text: "ñ"), through: engine))
         XCTAssertEqual(engine.trackedWordLength, 1)
     }
 
@@ -88,11 +94,11 @@ final class LayoutTransitionTests: XCTestCase {
                             protectedInput: { secure })
 
         for code: UInt16 in [45, 34, 41, 31] { // ni;o
-            XCTAssertNotNil(engine.handle(type: .keyDown, event: key(code)))
+            XCTAssertTrue(passes(key(code), through: engine))
         }
         XCTAssertEqual(engine.trackedWordLength, 4)
         secure = true
-        XCTAssertNotNil(engine.handle(type: .keyDown, event: key(49)))
+        XCTAssertTrue(passes(key(49), through: engine))
         XCTAssertEqual(engine.trackedWordLength, 0)
     }
 
@@ -108,8 +114,8 @@ final class LayoutTransitionTests: XCTestCase {
             let layouts = layouts(readSource: { self.en })
             let engine = engine(layouts: layouts, typer: typer, frontmostPID: { activePID })
             engine.perform([.backspace(1)])
-            XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
-            XCTAssertNil(engine.handle(type: .keyDown, event: key(4, text: "h")))
+            XCTAssertFalse(passes(key(0, text: "a"), through: engine))
+            XCTAssertFalse(passes(key(4, text: "h"), through: engine))
             activePID = pidAfterClick
 
             var forwarded: [Int64] = []

@@ -19,6 +19,16 @@ struct FocusToken {
         return FocusToken(pid: pid, element: focused as! AXUIElement)
     }
 
+    /// Chromium and Electron apps (Claude, Slack, VS Code) build their accessibility tree only
+    /// for assistive tools: without it the focused field and its caret cannot be read.
+    /// AXManualAccessibility asks for the tree without AXEnhancedUserInterface's window side effects.
+    @discardableResult
+    static func exposeWebContent(pid: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.15)
+        return AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue) == .success
+    }
+
     /// Excludes system Secure Input and Accessibility fields explicitly marked secure.
     var canReadText: Bool {
         guard !SecureInput.isEnabled else { return false }

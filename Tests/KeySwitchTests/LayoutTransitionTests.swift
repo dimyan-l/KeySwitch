@@ -103,7 +103,7 @@ final class LayoutTransitionTests: XCTestCase {
         let engine = engine(layouts: layouts, typer: typer)
 
         engine.perform([], switchingTo: .ru)
-        XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
+        XCTAssertFalse(passes(key(0, text: "a"), through: engine))
         wait(for: [requested], timeout: 2)
         XCTAssertTrue(engine.isTyping, "A successful request does not prove the source is active")
         current = ru
@@ -128,7 +128,7 @@ final class LayoutTransitionTests: XCTestCase {
         let engine = engine(layouts: layouts, typer: typer)
 
         engine.perform([], switchingTo: .ru)
-        XCTAssertNil(engine.handle(type: .keyDown, event: key(0, text: "a")))
+        XCTAssertFalse(passes(key(0, text: "a"), through: engine))
         wait(for: [released], timeout: 2)
         XCTAssertEqual(requests, 1)
         XCTAssertFalse(engine.isTyping)
@@ -500,6 +500,33 @@ final class LayoutTransitionTests: XCTestCase {
         XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
         engine.caretVerifiedAtBoundary(clickRevision: revision)
         for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine))
+    }
+
+    func testUnreadableCaretAfterClickStillFixesAClearFirstWord() throws {
+        // An Electron chat box (the Claude app) gives Accessibility no caret: "gkj[j" stayed as typed.
+        let engine = try wrongLayoutEngine(["привет", "плохо", "во"])
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        engine.caretUnreadableAfterClick(clickRevision: engine.clickRevision)
+        for code: UInt16 in [5, 37, 38, 33, 38] { XCTAssertTrue(passes(key(code), through: engine)) } // g k j [ j
+        XCTAssertFalse(passes(key(49), through: engine), "the first word after the click is fixed")
+    }
+
+    func testUnreadableCaretAfterClickLeavesShortOrLateWordsAlone() throws {
+        let engine = try wrongLayoutEngine(["привет", "во"])
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        // A two-letter token may be the tail of a word the click landed in.
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        engine.caretUnreadableAfterClick(clickRevision: engine.clickRevision)
+        for code: UInt16 in [2, 38] { XCTAssertTrue(passes(key(code), through: engine)) } // d j
+        XCTAssertTrue(passes(key(49), through: engine))
+        // An answer that arrives after the first key is ignored.
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        let revision = engine.clickRevision
+        XCTAssertTrue(passes(key(5), through: engine))
+        engine.caretUnreadableAfterClick(clickRevision: revision)
+        for code: UInt16 in [4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
         XCTAssertTrue(passes(key(49), through: engine))
     }
 
