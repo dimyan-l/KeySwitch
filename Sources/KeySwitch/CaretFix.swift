@@ -33,7 +33,7 @@ enum CaretFix {
             let word = String(chars[lead..<(chars.count - trail)])
             guard let repaired = mixed(word) else { return nil }
             return Plan(dropFirst: lead, dropLast: trail, word: word, choices: [repaired.text],
-                        flip: repaired.text, target: repaired.language, learnFlip: false)
+                        flip: repaired.text, target: repaired.language, learnFlip: true)
         }
 
         // Keep edge punctuation inside the word only when that reading is a real word
@@ -63,14 +63,16 @@ enum CaretFix {
         let word = String(chars[cut.first..<(chars.count - cut.last)])
         let flipped = flip(word)
         let sourceModel = classifier?.models[source]
-        let known = sourceModel.map { $0.score($0.core(normalizeWord(word))) != nil } ?? false
+        let sourceScore = sourceModel.flatMap { $0.score($0.core(normalizeWord(word))) }
+        let known = sourceScore != nil
+        let converts = classifier?.decide(current: word, alternative: flipped, currentLang: source).convert == true
 
         var choices: [String] = []
         func add(_ candidate: String) {
             guard candidate != word, !candidate.isEmpty, !choices.contains(candidate) else { return }
             choices.append(candidate)
         }
-        if classifier?.decide(current: word, alternative: flipped, currentLang: source).convert == true {
+        if converts {
             if let fixed = classifier?.spellingInOtherLayout(current: word, alternative: flipped, currentLang: source) {
                 add(fixed)
             } else {
@@ -92,7 +94,9 @@ enum CaretFix {
             }
         }
         guard !choices.isEmpty else { return nil }
+        let leansOther = classifier?.leansTowardOther(current: word, alternative: flipped, currentLang: source) == true
+        let shouldLearnFlip = !known || (leansOther && (sourceScore ?? 0) < 5.0)
         return Plan(dropFirst: cut.first, dropLast: cut.last, word: word, choices: choices,
-                    flip: flipped, target: target, learnFlip: !known)
+                    flip: flipped, target: target, learnFlip: shouldLearnFlip)
     }
 }

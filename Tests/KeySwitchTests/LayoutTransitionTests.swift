@@ -539,4 +539,68 @@ final class LayoutTransitionTests: XCTestCase {
         XCTAssertEqual(engine.trackedWordLength, 3)
         XCTAssertFalse(passes(key(49, text: " "), through: engine), "'nj is это")
     }
+
+    func testPunctuatedReplacementIsFoundByBareWordAndRemembered() throws {
+        let engine = try spellingEngine(typer: Typer(eventSink: { _ in }))
+        XCTAssertTrue(engine.applySpellingCorrection(original: "hellp,", replacement: "hello,", language: .en, word: "hellp"))
+        settle(engine)
+
+        let record = try XCTUnwrap(engine.recentCorrection(producing: "hello"),
+                                   "Caret undo strips trailing punctuation when looking up a recent replacement")
+        XCTAssertEqual(record.original, "hellp")
+        XCTAssertEqual(record.replacement, "hello")
+        engine.remember(record, source: .undo)
+        XCTAssertTrue(engine.store.rules.blocks("hellp", lang: .en, kind: .spell))
+    }
+
+    func testShiftSpaceTriggersAutomaticLayoutCorrection() throws {
+        let engine = try wrongLayoutEngine(["привет"])
+        for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        let shiftSpace = key(49, text: " ")
+        shiftSpace.flags = .maskShift
+        XCTAssertFalse(passes(shiftSpace, through: engine), "Lingering Shift on Space must still switch layout")
+        settle(engine)
+    }
+
+    func testClickNearReplacedWordRearmsEraseAndRetypeException() throws {
+        let typer = Typer(queue: DispatchQueue(label: "test.click-restore"), eventSink: { _ in })
+        let engine = try spellingEngine(typer: typer)
+        let hellp: [UInt16] = [4, 14, 37, 37, 35]
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine))
+        settle(engine)
+
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        engine.armRestoreWatchAfterClick(clickRevision: engine.clickRevision)
+        for _ in 0..<5 { XCTAssertTrue(passes(key(51), through: engine)) }
+        for code in hellp { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertTrue(passes(key(49), through: engine), "Retyped word after clicking and erasing is respected")
+        XCTAssertTrue(engine.store.rules.blocks("hellp", lang: .en, kind: .spell))
+        XCTAssertEqual(engine.store.rules.active.first?.source, .restore)
+    }
+
+    func testOptionBackspaceClearsUntrackedTokenForNextWord() throws {
+        let engine = try wrongLayoutEngine(["привет"])
+        let click = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left)!
+        XCTAssertNotNil(engine.handle(type: .leftMouseDown, event: click))
+        let optionBackspace = key(51)
+        optionBackspace.flags = .maskAlternate
+        XCTAssertTrue(passes(optionBackspace, through: engine))
+        for code: UInt16 in [5, 4, 11, 2, 17, 45] { XCTAssertTrue(passes(key(code), through: engine)) }
+        XCTAssertFalse(passes(key(49), through: engine), "Word typed after ⌥⌫ must be tracked and switched")
+        settle(engine)
+    }
+
+    func testSelectInputSourceSuppressesFalseExternalChange() throws {
+        let (en, ru) = try sources()
+        var current = en
+        let layouts = KeyboardLayouts(sources: [.en: en, .ru: ru], readSource: { current }, requestSource: { _ in
+            current = ru
+            return noErr
+        })
+        let engine = engine(layouts: layouts)
+        XCTAssertTrue(engine.selectInputSource(.ru))
+        XCTAssertFalse(engine.inputSourceDidChange(to: ru.id), "KeySwitch's own UI switch is not external")
+    }
 }
