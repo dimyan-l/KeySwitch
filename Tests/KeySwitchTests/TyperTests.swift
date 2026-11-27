@@ -136,8 +136,9 @@ final class TyperTests: XCTestCase {
             wait(for: [drained], timeout: 2)
             queue.suspend()
             // A replayed letter now starts the next tracked word, so Right Option converts that
-            // word instead of undoing the earlier correction.
-            let expectsWordFix = code == 0 && engine.layouts.currentLang != nil && engine.trackedWordLength == 1
+            // word instead of undoing the earlier correction (a conversion needs both layouts).
+            let expectsWordFix = code == 0 && engine.layouts.currentLang != nil && engine.layouts.hasBothLayouts
+                && engine.trackedWordLength == 1
             engine.manualFix()
             XCTAssertEqual(engine.isTyping, expectsWordFix, "Replayed text/navigation/Caps Lock must not leave stale undo")
             engine.cancelPendingTyping()
