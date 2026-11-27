@@ -334,14 +334,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         guard let self, self.applySelectionSuggestion(choice) else { return }
                         self.learn(choice, from: plan)
                         // A manual change toggles: the next tap on this word puts the old text back.
-                        let lang = Self.script(of: plan.word)
+                        let lang = AppDelegate.script(of: plan.word)
                         self.engine.record(replacement: choice, original: plan.word, lang: lang,
                                            kind: choice == plan.flip ? .layout : .spell, automatic: false)
                         // Remember the fix, so the same word is corrected by itself next time.
                         // A mixed word ("приdtn") is a one-off repair, not a word to learn.
                         let mixed = lang == .ru && plan.word.contains { $0.isASCII && $0.isLetter }
                         if !mixed {
-                            self.engine.teach(typed: plan.word, lang: lang, result: choice, resultLang: Self.script(of: choice))
+                            self.engine.teach(typed: plan.word, lang: lang, result: choice, resultLang: AppDelegate.script(of: choice))
                         }
                     }
                     // No pop-up: the best variant is applied at once, another tap puts the word back.

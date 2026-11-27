@@ -30,7 +30,7 @@ Descomprime el ZIP y mueve KeySwitchES.app a Aplicaciones. Activa un teclado ing
 | Añadir o quitar excepciones para teclado y erratas | Ajustes → Diccionarios → Excepciones |
 
 Los terminales, IDE y gestores de contraseñas están excluidos por defecto. El historial del portapapeles permanece en memoria; los textos fijados se guardan en `~/Library/Application Support/KeySwitchES/`.
-La ventana de sugerencias solo aparece al seleccionar una palabra y no cambia nada hasta que elijas una opción. Puedes desactivarla en Ajustes → Correcciones.
+No hay ventanas de sugerencias: seleccionar una palabra no muestra nada y ⌥ derecho aplica directamente la mejor opción (otra pulsación la deshace).
 
 El **modo prudente** está activado por defecto: una sugerencia basada solo en estadísticas se indica en naranja y se aplica únicamente con ⌥ derecho. Se protegen las direcciones, los identificadores con `_`, palabras con números y tokens con puntos internos. Si cambias de teclado a mitad de palabra, KeySwitch ES espera el siguiente espacio para empezar a comprobar de nuevo. Tab e Intro dejan que la aplicación de destino reciba la tecla. La reescritura automática se limita a 24 caracteres.
 
@@ -72,7 +72,7 @@ Puedes pausar la captura desde el menú. Tras varios tiempos de espera seguidos,
 
 ### Ajustes y diagnóstico
 
-«Ajustes…» abre una ventana con correcciones, diccionarios, aplicaciones excluidas y atajos. Los diccionarios permiten buscar, añadir, eliminar y deshacer el último cambio. Los últimos 50 cambios se conservan solo durante la sesión. En las sugerencias, las flechas eligen, Enter aplica y Esc cierra. El indicador compacto muestra Ⅱ cuando está en pausa.
+«Ajustes…» abre una ventana con correcciones, diccionarios, aplicaciones excluidas y atajos. Los diccionarios permiten buscar, añadir, eliminar y deshacer el último cambio. Los últimos 50 cambios se conservan solo durante la sesión. El indicador compacto muestra Ⅱ cuando está en pausa.
 
 Para recibir contadores y tiempos sin registrar el texto ni las pulsaciones, abre KeySwitch ES con `--diagnostics`. El argumento `--backspace-undo` habilita el deshacer inmediato con Retroceso cuando Accesibilidad puede verificar el texto junto al cursor. Cierra KeySwitch ES antes de abrirla con esos argumentos.
 

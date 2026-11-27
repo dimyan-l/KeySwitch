@@ -396,9 +396,15 @@ private struct ClayPalette {
     var panel: [Color] { colors(0xFFFDF5, 0xF1E7D5, 0x3D3D34, 0x2E302B) }
 
     private func colors(_ lightTop: UInt32, _ lightBottom: UInt32, _ darkTop: UInt32, _ darkBottom: UInt32) -> [Color] {
-        (dark ? [darkTop, darkBottom] : [lightTop, lightBottom]).map { hex in
-            Color(red: Double(hex >> 16) / 255, green: Double(hex >> 8 & 255) / 255, blue: Double(hex & 255) / 255)
-        }
+        let pair: [UInt32] = dark ? [darkTop, darkBottom] : [lightTop, lightBottom]
+        return pair.map(Self.color)
+    }
+
+    private static func color(_ hex: UInt32) -> Color {
+        let red = Double(hex >> 16) / 255
+        let green = Double((hex >> 8) & 255) / 255
+        let blue = Double(hex & 255) / 255
+        return Color(red: red, green: green, blue: blue)
     }
 }
 
