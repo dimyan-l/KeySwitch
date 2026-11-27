@@ -47,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastError: String?
     private var loadError: String?
     private var dictionaryLoadID: UInt64 = 0
+    private var userPaused = false
 
     // MARK: - Launch
 
@@ -90,11 +91,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observe(NSWorkspace.shared.notificationCenter, NSWorkspace.didActivateApplicationNotification) { [weak self] note in
             guard let self else { return }
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            self.engine.frontmostBundleID = app?.bundleIdentifier
-            self.engine.typer.updateFrontmostPID(app?.processIdentifier)
+            self.engine.updateFrontmostApp(bundleID: app?.bundleIdentifier, pid: app?.processIdentifier)
             self.engine.cancelPendingTyping()
             self.dismissSelectionSuggestions()
             if let app, app.bundleIdentifier != Bundle.main.bundleIdentifier { self.lastExternalApp = app }
+        }
+        observe(NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification) { [weak self] _ in
+            self?.scheduleWakeRecovery()
         }
         observe(DistributedNotificationCenter.default(), NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String)) { [weak self] _ in
             self?.inputSourceDidChange()
@@ -107,9 +110,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startEngineWhenTrusted()
         observeSelection()
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
-            self?.engine.typer.updateFrontmostPID(NSWorkspace.shared.frontmostApplication?.processIdentifier)
-            self?.secureInputDidChange()
-            self?.inputSourceDidChange()
+            guard let self else { return }
+            let app = NSWorkspace.shared.frontmostApplication
+            self.engine.updateFrontmostApp(bundleID: app?.bundleIdentifier, pid: app?.processIdentifier)
+            self.secureInputDidChange()
+            self.inputSourceDidChange()
         }
         RunLoop.main.add(timer, forMode: .common)
         inputSourceTimer = timer
@@ -196,6 +201,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusTitle()
     }
 
+    private func scheduleWakeRecovery() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.userPaused, !self.engine.isRunning,
+                  AXIsProcessTrusted(), CGPreflightListenEventAccess() else { return }
+            self.startEngine()
+        }
+    }
+
     /// Standard menu commands keep text fields and the settings window keyboard accessible.
     private func installEditMenu() {
         let main = NSMenu()
@@ -232,7 +245,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let externalChange = engine.inputSourceDidChange(to: source.id)
         if externalChange { dismissSelectionSuggestions() }
         guard externalChange || source.id != lastInputSourceID else { return }
-        layouts.refresh()
+        if let lang = source.lang, layouts.preferred[lang]?.id == source.id {
+            layouts.noteActiveSource(source)
+        } else {
+            layouts.refresh()
+        }
         updateStatusTitle()
     }
 
@@ -315,19 +332,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Right ⌥ next to a word that was missed earlier: put the caret inside the word or at
     /// its edge, tap, and the word is re-read in the other layout (or a typo fix is offered).
-    private func fixWordAtCaret() {
+    private func fixWordAtCaret(allowWebExposureRetry: Bool = true) {
         dismissSelectionSuggestions()
         let generation = selectionGeneration
         guard engine.isRunning, AXIsProcessTrusted(), !SecureInput.isEnabled,
               !settings.isExcluded(engine.frontmostBundleID) else { return }
         let extra = layouts.letterPunctuation
+        let activePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let capture = SelectedWord.captureAtCaret(extra: extra)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.selectionGeneration == generation, self.engine.isRunning,
                       !SecureInput.isEnabled, !self.settings.isExcluded(self.engine.frontmostBundleID) else { return }
                 switch capture {
-                case .noWord, .unsupported:
+                case .noWord:
+                    return
+                case .unsupported:
+                    if allowWebExposureRetry, let pid = activePID, self.webContentRequested.insert(pid).inserted {
+                        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                            _ = FocusToken.exposeWebContent(pid: pid)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+                                guard let self, self.selectionGeneration == generation else { return }
+                                self.fixWordAtCaret(allowWebExposureRetry: false)
+                            }
+                        }
+                    }
                     return
                 case .word(let token):
                     // A word KeySwitch changed earlier: put the user's own word back and remember it.
@@ -338,12 +367,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let selected = token.narrowed(dropFirst: plan.dropFirst, dropLast: plan.dropLast)
                     self.selectedWord = selected
                     let apply: (String) -> Void = { [weak self] choice in
-                        guard let self, self.applySelectionSuggestion(choice) else { return }
-                        self.learn(choice, from: plan)
+                        guard let self else { return }
+                        let choiceHasCyrillic = choice.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                        let wordHasCyrillic = plan.word.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                        let wordHasLatin = plan.word.contains { $0.isASCII && $0.isLetter }
+                        let choiceLang: Lang = choiceHasCyrillic ? .ru : .en
+                        let isLayoutChange = choiceLang == plan.target
+                            && (choiceHasCyrillic != wordHasCyrillic || (wordHasCyrillic && wordHasLatin))
+                        guard self.applySelectionSuggestion(choice, switchTo: isLayoutChange ? choiceLang : nil) else { return }
+                        self.learn(choice, choiceLang: choiceLang, isLayoutChange: isLayoutChange, from: plan)
                         // A manual change toggles: the next tap on this word puts the old text back.
-                        let cyrillic = plan.word.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
-                        self.engine.record(replacement: choice, original: plan.word, lang: cyrillic ? .ru : .en,
-                                           kind: choice == plan.flip ? .layout : .spell, automatic: false)
+                        let sourceLang: Lang = wordHasCyrillic && !wordHasLatin ? .ru : .en
+                        self.engine.record(replacement: choice, original: plan.word, lang: sourceLang,
+                                           kind: isLayoutChange ? .layout : .spell, automatic: false)
                     }
                     if plan.choices.count == 1 {
                         apply(plan.choices[0])
@@ -372,8 +408,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
-    private func learn(_ choice: String, from plan: CaretFix.Plan) {
-        if choice == plan.flip, plan.learnFlip { engine.learnPositive(choice, lang: plan.target) }
+    private func learn(_ choice: String, choiceLang: Lang, isLayoutChange: Bool, from plan: CaretFix.Plan) {
+        if isLayoutChange {
+            if plan.learnFlip { engine.learnPositive(choice, lang: plan.target) }
+        } else {
+            engine.learnPositive(choice, lang: choiceLang)
+        }
     }
 
     private func observeSelection() {
@@ -401,14 +441,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func checkCaretAfterClick() {
         guard engine.isRunning, !SecureInput.isEnabled, !settings.isExcluded(engine.frontmostBundleID) else { return }
         let revision = engine.clickRevision
-        // The global monitor sees mouse-up before the editor has moved its caret: reading at once
-        // returns the old position. A short delay is still well before the first keystroke.
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) { [weak self] in
+        let recentReplacement: String? = {
+            guard let last = engine.lastAutoCorrection, Date().timeIntervalSince(last.date) < 90 else { return nil }
+            return last.replacement
+        }()
+        // A minimal delay lets the target app update its insertion point after mouse-up
+        // while still finishing before the user's first keystroke.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.025) { [weak self] in
             let token = FocusToken.capture()
             let atBoundary = token?.caretIsAtWordBoundary()
+            let nearReplaced = recentReplacement.map { token?.hasWordNearCaret($0) == true } ?? false
             let pid = token?.pid ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
             DispatchQueue.main.async {
                 guard let self else { return }
+                if nearReplaced {
+                    self.engine.armRestoreWatchAfterClick(clickRevision: revision)
+                }
                 switch atBoundary {
                 case true?:
                     self.engine.caretVerifiedAtBoundary(clickRevision: revision)
@@ -455,13 +503,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         choices = Array(([recent.original] + choices.filter { $0 != recent.original }).prefix(3))
                     }
                     guard !choices.isEmpty else { return }
+                    let selectedText = selected.text
                     self.selectedWord = selected
                     self.selectionPanel.show(options: choices, bounds: selected.bounds) { [weak self] choice in
                         guard let self else { return }
                         let restoring = recent.map { $0.original == choice } ?? false
-                        let switchTo = restoring && recent?.automatic == true && recent?.kind == .layout ? recent?.lang : nil
-                        if self.applySelectionSuggestion(choice, switchTo: switchTo), restoring, let recent {
+                        let choiceCyrillic = choice.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                        let selectedCyrillic = selectedText.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+                        let choiceLang: Lang = choiceCyrillic ? .ru : .en
+                        let selectedLang: Lang = selectedCyrillic ? .ru : .en
+                        let isLayoutChange = choiceLang != selectedLang
+                        let switchTo: Lang?
+                        if restoring {
+                            switchTo = recent?.automatic == true && recent?.kind == .layout ? recent?.lang : nil
+                        } else {
+                            switchTo = isLayoutChange ? choiceLang : nil
+                        }
+                        guard self.applySelectionSuggestion(choice, switchTo: switchTo) else { return }
+                        if restoring, let recent {
                             self.engine.remember(recent, source: .undo)
+                        } else if isLayoutChange {
+                            let sourceScore = self.engine.classifier?.models[selectedLang]?.score(normalizeWord(selectedText))
+                            let leansOther = self.engine.classifier?.leansTowardOther(
+                                current: selectedText, alternative: choice, currentLang: selectedLang
+                            ) == true
+                            if sourceScore == nil || ((sourceScore ?? 0) < 5.0 && leansOther) {
+                                self.engine.learnPositive(choice, lang: choiceLang)
+                            }
+                        } else if normalizeWord(choice) != normalizeWord(selectedText) {
+                            self.engine.learnPositive(choice, lang: choiceLang)
                         }
                     }
                 }
@@ -483,7 +553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSSound.beep()
             return false
         }
-        if let target { layouts.select(target) }
+        if let target { engine.selectInputSource(target) }
         motion.acknowledgeCorrection()
         preferences.model.record(selected.text, choice)
         return true
@@ -614,17 +684,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let language = Lang(rawValue: raw) else { return }
-        if layouts.select(language) { inputSourceDidChange() } else { NSSound.beep() }
+        if engine.selectInputSource(language) { inputSourceDidChange() } else { NSSound.beep() }
     }
 
     @objc private func toggleAuto() { settings.autoEnabled.toggle(); preferences.model.onChange(); preferences.model.refresh() }
     @objc private func toggleSpell() { settings.spellEnabled.toggle(); preferences.model.onChange(); preferences.model.refresh() }
     @objc private func toggleInterception() {
         if engine.isRunning {
+            userPaused = true
             engine.stop()
         } else if !AXIsProcessTrusted() || !CGPreflightListenEventAccess() {
             lastError = "Проверьте разрешения для этой копии приложения: Универсальный доступ и Мониторинг ввода."
         } else if engine.start() {
+            userPaused = false
             lastError = nil
         } else {
             lastError = "Разрешения выданы, но macOS не создала перехват клавиш. Перезапустите приложение."

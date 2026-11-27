@@ -83,9 +83,31 @@ struct FocusToken {
         }
         if caret.location < count {
             guard let after = character(at: caret.location) else { return nil }
-            if !after.isWhitespace && !after.isNewline { return false }
+            if after.isLetter || after.isNumber || after == "'" || after == "-" { return false }
         }
         return isCurrent()
+    }
+
+    /// True when a small window around the caret contains `word` (case-insensitive),
+    /// used to re-arm retype-restore after the user clicks next to an auto-replaced word.
+    func hasWordNearCaret(_ word: String) -> Bool {
+        let needle = word.lowercased()
+        guard !needle.isEmpty else { return false }
+        AXUIElementSetMessagingTimeout(element, 0.04)
+        guard canReadText, let caret = selectionRange(), caret.length >= 0, caret.location >= 0 else { return false }
+        var countValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXNumberOfCharactersAttribute as CFString, &countValue) == .success,
+              let count = (countValue as? NSNumber)?.intValue, caret.location <= count else { return false }
+        let start = max(0, caret.location - 32)
+        let end = min(count, caret.location + max(caret.length, 32))
+        guard end > start else { return false }
+        var range = CFRange(location: start, length: end - start)
+        guard let value = AXValueCreate(.cfRange, &range) else { return false }
+        var rawText: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, kAXStringForRangeParameterizedAttribute as CFString,
+                                                         value, &rawText) == .success,
+              let window = (rawText as? String)?.lowercased() else { return false }
+        return window.contains(needle) && isCurrent()
     }
 
     private func selectionRange() -> CFRange? {

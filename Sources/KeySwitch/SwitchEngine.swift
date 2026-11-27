@@ -58,6 +58,8 @@ final class SwitchEngine {
     private var busy = false
     private var pendingInput: [(event: CGEvent, sourceID: String?)] = []
     private var requestedSourceID: String?
+    private var pendingLateSourceID: String?
+    private var pendingLateSourceUntil: TimeInterval = 0
     private var userRequestedInputSource = false
     private var idleActions: [() -> Void] = []
     private var typingPID: pid_t?
@@ -69,9 +71,11 @@ final class SwitchEngine {
     private var untrackedToken = false
     private var tapDisables: [TimeInterval] = []
     private var restoreWatch: RestoreWatch?
+    private(set) var lastAutoCorrection: RecentCorrection?
     /// Mouse clicks and keys since the last one: a click is trusted only if no key came after it.
     private(set) var clickRevision: UInt64 = 0
     private var keysSinceClick = 0
+    private var backspacesSinceClick = 0
     /// The field after a click could not tell where its caret is (Electron, some web views):
     /// the first word is tracked, but only a confident whole-word layout fix is applied.
     private var clickUnverified = false
@@ -160,6 +164,8 @@ final class SwitchEngine {
         typer.cancel()
         pendingInput.removeAll()
         requestedSourceID = nil
+        pendingLateSourceID = nil
+        pendingLateSourceUntil = 0
         idleActions.removeAll()
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -172,6 +178,7 @@ final class SwitchEngine {
         rightOptionDownAt = nil
         rightOptionDirty = false
         restoreWatch = nil
+        lastAutoCorrection = nil
         resetAll()
     }
 
@@ -189,6 +196,8 @@ final class SwitchEngine {
         typer.cancel()
         pendingInput.removeAll()
         requestedSourceID = nil
+        pendingLateSourceID = nil
+        pendingLateSourceUntil = 0
         idleActions.removeAll()
         busy = false
         rightOptionDownAt = nil
@@ -197,13 +206,53 @@ final class SwitchEngine {
         resetAll()
     }
 
+    func updateFrontmostApp(bundleID: String?, pid: pid_t?) {
+        if bundleID != frontmostBundleID {
+            frontmostBundleID = bundleID
+            lastAutoCorrection = nil
+            cancelPendingTyping()
+        }
+        typer.updateFrontmostPID(pid)
+    }
+
+    /// Selects a layout on behalf of KeySwitch UI actions (caret fix, selection flip, menu)
+    /// so the asynchronous TIS notification is recognized as our own rather than an external switch.
+    @discardableResult
+    func selectInputSource(_ language: Lang) -> Bool {
+        guard let target = layouts.preferred[language] else { return false }
+        if layouts.current().id == target.id {
+            layouts.confirmSelection(target.id)
+            return true
+        }
+        requestedSourceID = target.id
+        guard layouts.select(language) else {
+            requestedSourceID = nil
+            return false
+        }
+        let expectedID = target.id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, !self.busy, self.requestedSourceID == expectedID else { return }
+            self.requestedSourceID = nil
+        }
+        return true
+    }
+
     /// Check from the tap as well as the asynchronous TIS notifications.
     /// A layout change during a word makes its suffix unsafe to rewrite in isolation.
     @discardableResult
     func inputSourceDidChange(to id: String) -> Bool {
         if id == requestedSourceID {
+            if !busy { requestedSourceID = nil }
+            pendingLateSourceID = nil
             layouts.confirmSelection(id)
             return false
+        }
+        if !busy, let late = pendingLateSourceID {
+            pendingLateSourceID = nil
+            if id == late, ProcessInfo.processInfo.systemUptime <= pendingLateSourceUntil, word.isEmpty {
+                layouts.confirmSelection(id)
+                return false
+            }
         }
         guard layouts.observeInputSource(id) else { return false }
         let hadUnfinishedWord = untrackedToken || !word.isEmpty
@@ -258,24 +307,29 @@ final class SwitchEngine {
             KeyboardDiagnostics.decision(.wordFinished, "terminator=\(event.getIntegerValueField(.keyboardEventKeycode)) word=\(word.count) untracked=\(untrackedToken) busy=\(busy) secure=\(protectedInput()) excluded=\(settings.isExcluded(frontmostBundleID)) app=\(frontmostBundleID ?? "nil") lang=\(layouts.current().lang?.rawValue ?? "nil") mods=\(String(mods.rawValue, radix: 16))")
         }
         if protectedInput() {
+            lastAutoCorrection = nil
             if busy || !word.isEmpty || prev != nil || last != nil || rightOptionDownAt != nil {
                 cancelPendingTyping()
             }
             return pass
         }
         if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) {
+            if let readFrontmostBundleID {
+                let activeBundle = readFrontmostBundleID()
+                if activeBundle != frontmostBundleID {
+                    frontmostBundleID = activeBundle
+                    lastAutoCorrection = nil
+                }
+            }
             cancelPendingTyping()
             disregardWord()
             clickRevision &+= 1
             keysSinceClick = 0
+            backspacesSinceClick = 0
             return pass
         }
-        if let readFrontmostBundleID {
-            let activeBundle = readFrontmostBundleID()
-            if activeBundle != frontmostBundleID {
-                frontmostBundleID = activeBundle
-                cancelPendingTyping()
-            }
+        if frontmostBundleID == nil, let readFrontmostBundleID {
+            frontmostBundleID = readFrontmostBundleID()
         }
 
         if busy, frontmostPID() != typingPID {
@@ -375,6 +429,18 @@ final class SwitchEngine {
         clickUnverified = true
     }
 
+    /// Accessibility confirmed that a click landed next to the just-replaced word:
+    /// if the user erases it and retypes their original word, record an exception.
+    func armRestoreWatchAfterClick(clickRevision revision: UInt64) {
+        guard revision == clickRevision, !busy, let c = lastAutoCorrection,
+              Date().timeIntervalSince(c.date) < Self.restoreWindow else { return }
+        let erased = backspacesSinceClick
+        restoreWatch = RestoreWatch(correction: c, erased: erased)
+        if erased >= c.replacement.count, word.isEmpty {
+            untrackedToken = false
+        }
+    }
+
     private func handleKeyDown(_ event: CGEvent, afterDeadKey deadKey: String? = nil) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
@@ -395,6 +461,18 @@ final class SwitchEngine {
                 self.onHotkey?(hk)
             }
             return nil
+        }
+        // ⌥⌫ (delete word) and ⌘⌫ (delete line) erase to a boundary, so the next word is safe to track.
+        if code == 51, !flags.contains(.maskControl), !flags.contains(.maskSecondaryFn),
+           flags.contains(.maskAlternate) || flags.contains(.maskCommand) {
+            let savedWatch = restoreWatch
+            resetAll()
+            if var watch = savedWatch {
+                watch.erased += 32
+                restoreWatch = watch
+            }
+            backspacesSinceClick += 16
+            return pass
         }
         // Any shortcut or Option-character breaks the word.
         if !flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn]).isEmpty {
@@ -419,6 +497,7 @@ final class SwitchEngine {
         case 51: // Delete (backspace)
             if !flags.contains(.maskShift), event.getIntegerValueField(.keyboardEventAutorepeat) == 0,
                beginBackspaceUndo(event) { return nil }
+            backspacesSinceClick += 1
             restoreWatch?.erased += 1
             if !word.isEmpty {
                 word.removeLast()
@@ -427,6 +506,9 @@ final class SwitchEngine {
                 prev = nil
             } else {
                 prev = nil
+            }
+            if word.isEmpty, let watch = restoreWatch, watch.erased >= watch.correction.replacement.count {
+                untrackedToken = false
             }
             last = nil
             return pass
@@ -446,11 +528,12 @@ final class SwitchEngine {
                                    allowSpelling: InputPolicy.allowsAutomaticSpelling(terminator: code))
             // After Return the text may be sent: no retype-undo and no context from the previous line.
             restoreWatch = nil
+            lastAutoCorrection = nil
             resetAll()
             return fixed ? nil : pass
-        case 49: // Only a plain space can trigger automatic rewriting.
-            if untrackedToken || flags.contains(.maskShift) {
-                if untrackedToken { KeyboardDiagnostics.decision(.wordDropped, "space untracked") }
+        case 49: // Space (including lingering Shift during fast typing) triggers automatic rewriting.
+            if untrackedToken {
+                KeyboardDiagnostics.decision(.wordDropped, "space untracked")
                 resetAll(); return pass
             }
             return finishWord(source: source) ? nil : pass
@@ -570,7 +653,7 @@ final class SwitchEngine {
         let canSwitch = layoutEnabled && altStr.count == strokes.count
         let cautious = mode.isCautious(defaultValue: settings.cautiousMode)
         var contextLang: Lang?
-        if canSwitch, !cautious, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
+        if canSwitch, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
             let pc = layouts.string(p.strokes, layout: cur.layout)
             let pa = layouts.string(p.strokes, in: target)
             if pc.count == p.strokes.count, pa.count == p.strokes.count,
@@ -624,6 +707,7 @@ final class SwitchEngine {
         // Pull a previous word along ("z ghbdtn." -> "я привет.", "dj dctv" -> "во всем").
         var newText = plan.prefix + plan.alternativeWord + plan.suffix
         var originalText = curStr
+        var retroPair: (replacement: String, original: String, core: String)?
         if plan.prefix.isEmpty, let p = prev, p.lang == curLang, p.strokes.count <= 16 {
             let pc = layouts.string(p.strokes, layout: cur.layout)
             let pa = layouts.string(p.strokes, in: target)
@@ -635,6 +719,8 @@ final class SwitchEngine {
                         : classifier.shouldRetroFix(current: pc, alternative: pa, currentLang: curLang) {
                 newText = pa + " " + plan.alternativeWord + plan.suffix
                 originalText = pc + " " + curStr
+                let prevCore = classifier.models[curLang]?.core(normalizeWord(pc)) ?? normalizeWord(pc)
+                retroPair = (pa, pc, prevCore.isEmpty ? normalizeWord(pc) : prevCore)
             }
         }
 
@@ -648,6 +734,10 @@ final class SwitchEngine {
 
         last = Correction(typedText: newText, originalText: originalText,
                           from: curLang, originalWord: currentCore, kind: .layout)
+        if let retroPair {
+            record(replacement: retroPair.replacement, original: retroPair.original, lang: curLang,
+                   originalWord: retroPair.core, kind: .layout, watchRestore: false)
+        }
         record(replacement: plan.alternativeWord, original: plan.currentWord, lang: curLang,
                originalWord: currentCore, kind: .layout, watchRestore: true)
         prev = plan.alternativeWord == altStr ? (strokes, target) : nil
@@ -678,15 +768,37 @@ final class SwitchEngine {
         return acceptsSpelling(word, lang)
     }
 
+    static func stripSharedEdgePunctuation(original: String, replacement: String) -> (original: String, replacement: String) {
+        var orig = Array(original)
+        var repl = Array(replacement)
+        while let o = orig.first, let r = repl.first, o == r, !o.isLetter {
+            orig.removeFirst()
+            repl.removeFirst()
+        }
+        while let o = orig.last, let r = repl.last, o == r, !o.isLetter {
+            orig.removeLast()
+            repl.removeLast()
+        }
+        guard !orig.isEmpty, !repl.isEmpty else { return (original, replacement) }
+        return (String(orig), String(repl))
+    }
+
     /// Remembers a replacement so a later return to the word can revert it.
     func record(replacement: String, original: String, lang: Lang, originalWord: String? = nil,
                 kind: FixKind, automatic: Bool = true, watchRestore: Bool = false) {
-        guard replacement != original, !replacement.isEmpty, !original.isEmpty else { return }
-        let entry = RecentCorrection(replacement: replacement, original: original, lang: lang,
-                                     originalWord: originalWord ?? normalizeWord(original),
+        let stripped = Self.stripSharedEdgePunctuation(original: original, replacement: replacement)
+        guard stripped.replacement != stripped.original, !stripped.replacement.isEmpty, !stripped.original.isEmpty else { return }
+        let rawCore = originalWord ?? (classifier?.models[lang]?.core(normalizeWord(stripped.original)) ?? normalizeWord(stripped.original))
+        let entry = RecentCorrection(replacement: stripped.replacement, original: stripped.original, lang: lang,
+                                     originalWord: rawCore.isEmpty ? normalizeWord(stripped.original) : rawCore,
                                      kind: kind, automatic: automatic, date: Date())
         store.recordCorrection(entry)
-        restoreWatch = watchRestore ? RestoreWatch(correction: entry) : nil
+        if watchRestore {
+            restoreWatch = RestoreWatch(correction: entry)
+            lastAutoCorrection = entry
+        } else {
+            restoreWatch = nil
+        }
     }
 
     /// The most recent replacement that produced `text` (case and ё-insensitive).
@@ -698,6 +810,7 @@ final class SwitchEngine {
     func remember(_ c: RecentCorrection, source: RuleSource) {
         if store.correction(producing: c.replacement) == c { store.removeCorrection(producing: c.replacement) }
         if case .some(let watch) = restoreWatch, watch.correction == c { restoreWatch = nil }
+        if lastAutoCorrection == c { lastAutoCorrection = nil }
         guard c.automatic else { return }
         store.addRule(c.originalWord, lang: c.lang, kind: c.kind, result: c.replacement, source: source)
     }
@@ -755,7 +868,7 @@ final class SwitchEngine {
                 self.finishTyping(to: pid, runID: runID)
                 return
             }
-            let deadline = ProcessInfo.processInfo.systemUptime + 0.075
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.20
             self.waitForInputSource(target.id, from: originID, until: deadline, pid: pid, runID: runID, onSuccess: onSuccess)
         }
     }
@@ -767,16 +880,21 @@ final class SwitchEngine {
         let currentID = layouts.current().id
         let didSwitch = !userRequestedInputSource && requestedSourceID == targetID && currentID == targetID
         if didSwitch {
+            pendingLateSourceID = nil
             layouts.confirmSelection(currentID)
         } else if !userRequestedInputSource, requestedSourceID == targetID,
                   currentID == originID, ProcessInfo.processInfo.systemUptime < deadline {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { [weak self] in
                 self?.waitForInputSource(targetID, from: originID, until: deadline,
                                          pid: pid, runID: runID, onSuccess: onSuccess)
             }
             return
         } else {
             KeyboardDiagnostics.record(.sourceUnconfirmed)
+            if !userRequestedInputSource, currentID == originID {
+                pendingLateSourceID = targetID
+                pendingLateSourceUntil = ProcessInfo.processInfo.systemUptime + 0.35
+            }
             if word.isEmpty { resetAll() } else { disregardWord() }
             _ = layouts.observeInputSource(currentID)
         }
@@ -882,7 +1000,8 @@ final class SwitchEngine {
             let alt = layouts.string(word, in: target)
             let original = layouts.string(word, layout: source.layout)
             guard original.count == word.count, alt.count == word.count, original != alt else { return }
-            let learn = !isKnown(original, lang: curLang)
+            let learn = shouldLearnManualFlip(original: original, from: curLang, alternative: alt, to: target)
+            record(replacement: alt, original: original, lang: curLang, kind: .layout, automatic: false)
             perform([.backspace(word.count), .text(alt)], switchingTo: target) { [weak self] in
                 if learn { self?.learnPositive(alt, lang: target) }
             }
@@ -892,7 +1011,8 @@ final class SwitchEngine {
             let alt = layouts.string(p.strokes, in: target)
             let original = layouts.string(p.strokes, layout: source.layout)
             guard original.count == p.strokes.count, alt.count == p.strokes.count, original != alt else { return }
-            let learn = !isKnown(original, lang: curLang)
+            let learn = shouldLearnManualFlip(original: original, from: curLang, alternative: alt, to: target)
+            record(replacement: alt, original: original, lang: curLang, kind: .layout, automatic: false)
             perform([.backspace(p.strokes.count + 1), .text(alt), .key(49, [])], switchingTo: target) { [weak self] in
                 if learn { self?.learnPositive(alt, lang: target) }
             }
@@ -944,10 +1064,13 @@ final class SwitchEngine {
         return true
     }
 
-    /// Flipping a real word away (an accidental tap) must not teach its gibberish reading.
-    private func isKnown(_ text: String, lang: Lang) -> Bool {
-        guard let m = classifier?.models[lang] else { return false }
-        return m.score(m.core(normalizeWord(text))) != nil
+    /// Flipping a real word away (an accidental tap) must not teach its gibberish reading,
+    /// while flipping rare dictionary junk ("ns" -> "ты") still learns when the other layout wins.
+    private func shouldLearnManualFlip(original: String, from curLang: Lang, alternative: String, to target: Lang) -> Bool {
+        guard let classifier, let curModel = classifier.models[curLang] else { return true }
+        let origCore = curModel.core(normalizeWord(original))
+        guard let origScore = curModel.score(origCore) else { return true }
+        return origScore < 5.0 && classifier.leansTowardOther(current: original, alternative: alternative, currentLang: curLang)
     }
 
     func learnPositive(_ text: String, lang: Lang) {
