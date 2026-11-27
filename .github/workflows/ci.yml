@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and test on macOS
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shared sources are identical in RU/EN and EN/ES
+        run: ./tools/check_shared_sources.sh
+      - name: RU/EN — build and tests
+        run: swift build && swift test
+      - name: RU/EN — dictionary self-test of the release build
+        run: |
+          swift build -c release
+          "$(swift build -c release --show-bin-path)/KeySwitch" --selftest | tail -4
+      - name: EN/ES — build and tests
+        working-directory: KeySwitchES
+        run: swift build && swift test

@@ -32,7 +32,6 @@ final class Settings {
             "cautiousMode": true,
             "spellEnabled": false,
             "clipboardEnabled": false,
-            "selectionSuggestionsEnabled": true,
             "sound": false,
             "clipboardSize": 30,
             "excluded": Settings.defaultExcluded,
@@ -54,10 +53,6 @@ final class Settings {
     var clipboardEnabled: Bool {
         get { d.bool(forKey: "clipboardEnabled") }
         set { d.set(newValue, forKey: "clipboardEnabled") }
-    }
-    var selectionSuggestionsEnabled: Bool {
-        get { d.bool(forKey: "selectionSuggestionsEnabled") }
-        set { d.set(newValue, forKey: "selectionSuggestionsEnabled") }
     }
     var sound: Bool {
         get { d.bool(forKey: "sound") }
@@ -117,8 +112,9 @@ final class UserStore {
         var pinned: [String] = []
         var rules: [UserRule] = []
         var rulesSeededFrom032 = false
+        var taught: [TaughtFix] = []
 
-        private enum CodingKeys: String, CodingKey { case learned, pinned, rules, rulesSeededFrom032 }
+        private enum CodingKeys: String, CodingKey { case learned, pinned, rules, rulesSeededFrom032, taught }
 
         init() {}
 
@@ -128,6 +124,7 @@ final class UserStore {
             pinned = try values.decodeIfPresent([String].self, forKey: .pinned) ?? []
             rules = try values.decodeIfPresent([UserRule].self, forKey: .rules) ?? []
             rulesSeededFrom032 = try values.decodeIfPresent(Bool.self, forKey: .rulesSeededFrom032) ?? false
+            taught = try values.decodeIfPresent([TaughtFix].self, forKey: .taught) ?? []
         }
     }
 
@@ -185,6 +182,8 @@ final class UserStore {
         return try JSONDecoder().decode(Payload.self, from: JSONSerialization.data(withJSONObject: object))
     }
     private(set) var rules = RuleBook()
+    /// Fixes you made with right ⌥, by `TaughtFix.id`.
+    private(set) var taughtFixes: [String: TaughtFix] = [:]
     private(set) var saveError: String?
     private var canSave = true
     /// Replacements by normalized replacement text: the newest one for each word.
@@ -214,6 +213,7 @@ final class UserStore {
             }
         }
         rules = RuleBook(payload.rules)
+        for fix in payload.taught.sorted(by: { $0.modified < $1.modified }) { taughtFixes[fix.id] = fix }
         loadCorrections()
         seedBundledRules()
         seedCustomLists()
@@ -243,6 +243,26 @@ final class UserStore {
     func removeRule(_ id: String) {
         guard rules.byKey[id] != nil else { return }
         rules.remove(id)
+        save()
+    }
+
+    // MARK: - Fixes you made yourself (learned.json → taught)
+
+    func taughtFix(_ word: String, lang: Lang) -> TaughtFix? {
+        taughtFixes[TaughtFix.key(word, lang)]
+    }
+
+    func addTaughtFix(_ fix: TaughtFix) {
+        var fix = fix
+        fix.word = normalizeWord(fix.word)
+        guard !fix.word.isEmpty, fix.word.count <= 64, !fix.result.isEmpty,
+              !fix.word.contains(where: \.isWhitespace), !fix.result.contains(where: \.isWhitespace) else { return }
+        taughtFixes[fix.id] = fix
+        save()
+    }
+
+    func removeTaughtFix(_ word: String, lang: Lang) {
+        guard taughtFixes.removeValue(forKey: TaughtFix.key(word, lang)) != nil else { return }
         save()
     }
 
@@ -313,6 +333,7 @@ final class UserStore {
     private func save() {
         guard canSave else { return }
         payload.rules = rules.all
+        payload.taught = taughtFixes.values.sorted { ($0.modified, $0.id) < ($1.modified, $1.id) }
         let data: Data
         do {
             let known = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as! [String: Any]

@@ -218,7 +218,6 @@ private struct PreferencesView: View {
                     Toggle(ui("Осторожный режим", "Modo prudente"), isOn: model.flag(\.cautiousMode))
                     Text(ui("Сомнительный вариант можно применить правым Option.", "Pulsa Option derecho para aplicar una sugerencia dudosa."))
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle(ui("Варианты при выделении слова", "Sugerencias al seleccionar una palabra"), isOn: model.flag(\.selectionSuggestionsEnabled))
                     Toggle(ui("Звук после исправления", "Sonido al corregir"), isOn: model.flag(\.sound))
                 }
                 clayCard(ui("Буфер обмена", "Portapapeles"), symbol: "clipboard", colors: palette.peach) {
@@ -357,8 +356,7 @@ private struct PreferencesView: View {
     }
     private var shortcuts: some View {
         VStack(alignment: .leading, spacing: 18) {
-            shortcut("⌥", ui("Правый Option", "Option derecho"), ui("У слова — исправить. Сразу после автоматической замены — отменить её.", "Junto a una palabra: corregir. Tras una corrección automática: deshacer."))
-            shortcut("↑ ↓  ↵  esc", ui("В панели вариантов", "En las sugerencias"), ui("Выбрать вариант, применить или закрыть панель.", "Elegir, aplicar o cerrar las sugerencias."))
+            shortcut("⌥", ui("Правый Option", "Option derecho"), ui("У слова — исправить и запомнить. Сразу после автоматической замены — отменить её.", "Junto a una palabra: corregir. Tras una corrección automática: deshacer."))
             shortcut("⌃ ⌥ R", ui("Выделенный текст", "Texto seleccionado"), ui("Переключить раскладку выделенного фрагмента.", "Cambiar el teclado del texto seleccionado."))
             shortcut("⌃ ⌥ V", ui("Буфер обмена", "Portapapeles"), ui("Открыть историю. С Option — закрепить фразу.", "Abrir el historial. Con Option: fijar una frase."))
             Spacer()

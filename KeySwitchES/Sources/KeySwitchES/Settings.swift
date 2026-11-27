@@ -32,7 +32,6 @@ final class Settings {
             "cautiousMode": true,
             "spellEnabled": false,
             "clipboardEnabled": false,
-            "selectionSuggestionsEnabled": true,
             "sound": false,
             "clipboardSize": 30,
             "excluded": Settings.defaultExcluded,
@@ -54,10 +53,6 @@ final class Settings {
     var clipboardEnabled: Bool {
         get { d.bool(forKey: "clipboardEnabled") }
         set { d.set(newValue, forKey: "clipboardEnabled") }
-    }
-    var selectionSuggestionsEnabled: Bool {
-        get { d.bool(forKey: "selectionSuggestionsEnabled") }
-        set { d.set(newValue, forKey: "selectionSuggestionsEnabled") }
     }
     var sound: Bool {
         get { d.bool(forKey: "sound") }

@@ -36,7 +36,6 @@ final class SwitchEngine {
     private let verifyBackspaceUndo: ((String, pid_t) -> Bool)?
     private static let maxPendingEvents = 128
 
-    var onSuggestionKey: ((UInt16, CGEventFlags) -> Bool)?
     var onHotkey: ((Hotkey) -> Void)?
     var onCorrection: ((_ from: String, _ to: String) -> Void)?
     var onSuggestion: (() -> Void)?
@@ -345,7 +344,6 @@ final class SwitchEngine {
         let pass = Unmanaged.passUnretained(event)
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
-        if onSuggestionKey?(code, flags) == true { return nil }
         if rightOptionDownAt != nil { rightOptionDirty = true }
 
         // Global hotkeys: ⌃⌥ + key

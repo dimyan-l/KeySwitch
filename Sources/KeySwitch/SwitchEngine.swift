@@ -39,7 +39,6 @@ final class SwitchEngine {
     private static let maxPendingEvents = 128
     private static let restoreWindow: TimeInterval = 90
 
-    var onSuggestionKey: ((UInt16, CGEventFlags) -> Bool)?
     var onHotkey: ((Hotkey) -> Void)?
     var onCorrection: ((_ from: String, _ to: String) -> Void)?
     var onSuggestion: (() -> Void)?
@@ -77,6 +76,8 @@ final class SwitchEngine {
     private var clickUnverified = false
     /// A dead key ("'" on U.S. International) arrives with no text; the next key carries both.
     private var pendingDeadKey: String?
+    /// The word being typed was switched by hand with right ⌥: the layout it was started in.
+    private var manualFlipFrom: Lang?
     typealias RecentCorrection = CorrectionRecord
     /// Every replacement KeySwitch made, newest per word, stored in corrections.json.
     var recentCorrections: [RecentCorrection] { store.corrections.values.sorted { $0.date < $1.date } }
@@ -179,6 +180,7 @@ final class SwitchEngine {
         word = []
         prev = nil
         last = nil
+        manualFlipFrom = nil
         untrackedToken = false
         clickUnverified = false
     }
@@ -379,7 +381,6 @@ final class SwitchEngine {
         let pass = Unmanaged.passUnretained(event)
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
-        if onSuggestionKey?(code, flags) == true { return nil }
         if rightOptionDownAt != nil { rightOptionDirty = true }
 
         // Global hotkeys: ⌃⌥ + key
@@ -517,6 +518,8 @@ final class SwitchEngine {
                             allowSpelling: Bool = true) -> Bool {
         let strokes = word
         word = []
+        let flippedFrom = manualFlipFrom
+        manualFlipFrom = nil
         let afterUnverifiedClick = clickUnverified
         clickUnverified = false
         guard !strokes.isEmpty else {
@@ -530,6 +533,14 @@ final class SwitchEngine {
             prev = nil
             last = nil
             return false
+        }
+        if let from = flippedFrom, let lang = source.lang, from != lang {
+            // Switched by hand halfway through: remember the whole word, not the typed part.
+            let typed = layouts.string(strokes, in: from)
+            let shown = layouts.string(strokes, layout: source.layout)
+            if typed.count == strokes.count, shown.count == strokes.count {
+                teach(typed: typed, lang: from, result: shown, resultLang: lang)
+            }
         }
         let cur = source
         let mode = settings.applicationMode(for: frontmostBundleID)
@@ -566,6 +577,33 @@ final class SwitchEngine {
                 last = nil
                 return false
             }
+        }
+        // A word you fixed by hand before is fixed the same way, without asking the classifier again.
+        if let taught = TaughtFixes.replacement(
+            for: curStr, lang: curLang, lookup: { self.store.taughtFixes[$0] },
+            flip: { range, lang in
+                let text = self.layouts.string(Array(strokes[range]), in: lang)
+                return text.count == range.count ? text : nil
+            }),
+           taught.fix.resultLang == curLang || layouts.hasBothLayouts,
+           taught.isLayoutFlip || allowSpelling,
+           !afterUnverifiedClick || (taught.isLayoutFlip && taught.typedWord.count >= 3) {
+            let switchTo: Lang? = taught.fix.resultLang != curLang ? taught.fix.resultLang : nil
+            let kind: FixKind = switchTo != nil ? .layout : .spell
+            let key = normalizeWord(taught.typedWord)
+            KeyboardDiagnostics.decision(.wordFinished, "fix reason=taught kind=\(kind.rawValue)")
+            var actions = replacementActions(original: curStr, replacement: taught.text)
+            actions.append(terminator)
+            perform(actions, switchingTo: switchTo) { [weak self] in
+                guard let self, self.isRunning else { return }
+                self.bumpStats()
+                self.onCorrection?(taught.typedWord, taught.word)
+            }
+            last = Correction(typedText: taught.text, originalText: curStr, from: curLang, originalWord: key, kind: kind)
+            record(replacement: taught.word, original: taught.typedWord, lang: curLang, originalWord: key,
+                   kind: kind, watchRestore: true)
+            prev = switchTo != nil && taught.text == altStr ? (strokes, curLang.other) : nil
+            return true
         }
         let canSwitch = layoutEnabled && altStr.count == strokes.count
         let cautious = mode.isCautious(defaultValue: settings.cautiousMode)
@@ -696,6 +734,9 @@ final class SwitchEngine {
 
     /// The user reverted `c`: forget it and, for an automatic change, never repeat it.
     func remember(_ c: RecentCorrection, source: RuleSource) {
+        // A change you reverted is not taught any more, whoever made it.
+        store.removeTaughtFix(c.originalWord, lang: c.lang)
+        store.removeTaughtFix(c.original, lang: c.lang)
         if store.correction(producing: c.replacement) == c { store.removeCorrection(producing: c.replacement) }
         if case .some(let watch) = restoreWatch, watch.correction == c { restoreWatch = nil }
         guard c.automatic else { return }
@@ -859,17 +900,17 @@ final class SwitchEngine {
             last = nil
             let actions: [Typer.Action] = [.backspace(c.typedText.count + 1), .text(c.originalText), .key(49, [])]
             restoreWatch = nil
-            perform(actions, switchingTo: c.kind == .layout ? c.from : nil) { [weak self] in
-                guard let self else { return }
-                // The history keys words without edge punctuation ("привет." → "привет").
-                let lastWord = c.typedText.split(separator: " ").last.map(String.init) ?? c.typedText
-                let core = lastWord.trimmingCharacters(in: CharacterSet.letters.inverted)
-                if let r = self.store.correction(producing: core), r.originalWord == c.originalWord {
-                    self.store.removeCorrection(producing: r.replacement)
-                }
-                self.store.addRule(c.originalWord, lang: c.from, kind: c.kind,
-                                   result: c.typedText, source: .undo)
+            // Remember the decision at once: it must not depend on the retype finishing
+            // (a key pressed meanwhile or a slow layout switch would otherwise lose it).
+            // The history keys words without edge punctuation ("привет." → "привет").
+            let lastWord = c.typedText.split(separator: " ").last.map(String.init) ?? c.typedText
+            let core = lastWord.trimmingCharacters(in: CharacterSet.letters.inverted)
+            if let r = store.correction(producing: core), r.originalWord == c.originalWord {
+                store.removeCorrection(producing: r.replacement)
             }
+            store.removeTaughtFix(c.originalWord, lang: c.from)
+            store.addRule(c.originalWord, lang: c.from, kind: c.kind, result: c.typedText, source: .undo)
+            perform(actions, switchingTo: c.kind == .layout ? c.from : nil)
             prev = nil
             return
         }
@@ -883,6 +924,8 @@ final class SwitchEngine {
             let original = layouts.string(word, layout: source.layout)
             guard original.count == word.count, alt.count == word.count, original != alt else { return }
             let learn = !isKnown(original, lang: curLang)
+            // The word is not finished yet: it is remembered whole when it ends.
+            if manualFlipFrom == nil { manualFlipFrom = curLang }
             perform([.backspace(word.count), .text(alt)], switchingTo: target) { [weak self] in
                 if learn { self?.learnPositive(alt, lang: target) }
             }
@@ -893,6 +936,7 @@ final class SwitchEngine {
             let original = layouts.string(p.strokes, layout: source.layout)
             guard original.count == p.strokes.count, alt.count == p.strokes.count, original != alt else { return }
             let learn = !isKnown(original, lang: curLang)
+            noteManualFlip(shown: original, lang: curLang, flipped: alt, target: target)
             perform([.backspace(p.strokes.count + 1), .text(alt), .key(49, [])], switchingTo: target) { [weak self] in
                 if learn { self?.learnPositive(alt, lang: target) }
             }
@@ -941,6 +985,56 @@ final class SwitchEngine {
             let verified = verifyBackspaceUndo(suffix, pid)
             DispatchQueue.main.async { complete(verified) }
         }
+        return true
+    }
+
+    /// A finished word switched by hand. Switching back a word KeySwitch replaced is an undo;
+    /// anything else is remembered, so the same word is fixed automatically next time.
+    private func noteManualFlip(shown: String, lang: Lang, flipped: String, target: Lang) {
+        let letters = CharacterSet.letters.inverted
+        if let r = store.correction(producing: shown.trimmingCharacters(in: letters)), r.lang == target,
+           normalizeWord(r.original.trimmingCharacters(in: letters)) == normalizeWord(flipped.trimmingCharacters(in: letters)) {
+            remember(r, source: .undo)
+            return
+        }
+        teach(typed: shown, lang: lang, result: flipped, resultLang: target)
+    }
+
+    /// You changed `typed` (typed in `lang`) into `result` yourself: make the same change
+    /// automatically the next time this word is typed. Returns false when it is not remembered.
+    @discardableResult
+    func teach(typed: String, lang: Lang, result: String, resultLang: Lang) -> Bool {
+        let a = Array(typed), b = Array(result)
+        var typedWord = typed, resultWord = result
+        if a.count == b.count {
+            // The same keys in two layouts: drop the punctuation that is punctuation in both
+            // ("ytn," → "нет,"), keep keys that are letters on one side ("k.,k." → "люблю").
+            var first = 0, end = a.count
+            while first < end, !a[first].isLetter, !b[first].isLetter { first += 1 }
+            while end > first, !a[end - 1].isLetter, !b[end - 1].isLetter { end -= 1 }
+            typedWord = String(a[first..<end])
+            resultWord = String(b[first..<end])
+        } else {
+            let letters = CharacterSet.letters.inverted
+            typedWord = typed.trimmingCharacters(in: letters)
+            resultWord = result.trimmingCharacters(in: letters)
+        }
+        let word = normalizeWord(typedWord)
+        let fixed = normalizeWord(resultWord)
+        // The opposite change is not what you want any more.
+        store.removeTaughtFix(fixed, lang: resultLang)
+        guard !word.isEmpty, !fixed.isEmpty, word != fixed || lang != resultLang,
+              word.count <= InputPolicy.maxAutomaticWordLength,
+              let model = classifier?.models[resultLang], model.isWord(model.core(fixed)) else { return false }
+        // An accidental tap on a real word must not teach its gibberish reading ("привет" → "ghbdtn").
+        guard !isKnown(typedWord, lang: lang) || isKnown(resultWord, lang: resultLang) else { return false }
+        var blocked = [word]
+        if let core = classifier?.models[lang]?.core(word), core != word { blocked.append(core) }
+        for w in blocked {
+            for kind in [FixKind.layout, .spell] { store.removeRule(UserRule.key(w, lang, kind)) }
+        }
+        store.addTaughtFix(TaughtFix(word: word, lang: lang, result: resultWord.lowercased(),
+                                     resultLang: resultLang, modified: Date()))
         return true
     }
 

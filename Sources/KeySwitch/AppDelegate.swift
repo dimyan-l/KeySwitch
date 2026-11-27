@@ -28,7 +28,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var clipboard = ClipboardHistory(store: store)
     private let settings = Settings.shared
     private let motion = MotionBadge()
-    private let selectionPanel = SelectionSuggestionPanel()
     private lazy var preferences = PreferencesWindowController(store: store) { model in
         AnyView(ApplicationProfilesView(model: model))
     }
@@ -60,10 +59,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         preferences.model.reload = { [weak self] in self?.loadDictionaries() }
         observe(NotificationCenter.default, .keySwitchClearClipboard) { [weak self] _ in self?.clipboard.clear() }
-        engine.onSuggestionKey = { [weak self] code, flags in
-            guard flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift, .maskSecondaryFn]).isEmpty else { return false }
-            return self?.selectionPanel.handleKey(code) ?? false
-        }
         statusItem = NSStatusBar.system.statusItem(withLength: 66)
         let menu = NSMenu()
         menu.delegate = self
@@ -117,7 +112,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard !selectionPanel.isVisible else { return false }
         preferences.present()
         return false
     }
@@ -134,7 +128,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (center, token) in observers { center.removeObserver(token) }
         observers.removeAll()
         for monitor in selectionMonitors { NSEvent.removeMonitor(monitor) }
-        selectionPanel.hide()
         engine.stop()
         store.flushPendingWrites()
     }
@@ -341,15 +334,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         guard let self, self.applySelectionSuggestion(choice) else { return }
                         self.learn(choice, from: plan)
                         // A manual change toggles: the next tap on this word puts the old text back.
-                        let cyrillic = plan.word.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
-                        self.engine.record(replacement: choice, original: plan.word, lang: cyrillic ? .ru : .en,
+                        let lang = Self.script(of: plan.word)
+                        self.engine.record(replacement: choice, original: plan.word, lang: lang,
                                            kind: choice == plan.flip ? .layout : .spell, automatic: false)
+                        // Remember the fix, so the same word is corrected by itself next time.
+                        // A mixed word ("приdtn") is a one-off repair, not a word to learn.
+                        let mixed = lang == .ru && plan.word.contains { $0.isASCII && $0.isLetter }
+                        if !mixed {
+                            self.engine.teach(typed: plan.word, lang: lang, result: choice, resultLang: Self.script(of: choice))
+                        }
                     }
-                    if plan.choices.count == 1 {
-                        apply(plan.choices[0])
-                    } else {
-                        self.selectionPanel.show(options: plan.choices, bounds: selected.bounds, onChoose: apply)
-                    }
+                    // No pop-up: the best variant is applied at once, another tap puts the word back.
+                    apply(plan.choices[0])
                 }
             }
         }
@@ -372,6 +368,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    private static func script(of text: String) -> Lang {
+        text.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) } ? .ru : .en
+    }
+
     private func learn(_ choice: String, from plan: CaretFix.Plan) {
         if choice == plan.flip, plan.learnFlip { engine.learnPositive(choice, lang: plan.target) }
     }
@@ -383,17 +383,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         if let down { selectionMonitors.append(down) }
         let up = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: { [weak self] _ in
-            self?.scheduleSelectionSuggestions()
             self?.checkCaretAfterClick()
         })
         if let up { selectionMonitors.append(up) }
-        let keyUp = NSEvent.addGlobalMonitorForEvents(matching: [.keyUp], handler: { [weak self] event in
-            if event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Typer.marker,
-               event.modifierFlags.contains(.shift), (123...126).contains(event.keyCode) {
-                self?.scheduleSelectionSuggestions()
-            }
-        })
-        if let keyUp { selectionMonitors.append(keyUp) }
     }
 
     /// A click usually lands in an empty field or after the last word (a chat box). Ask the
@@ -429,44 +421,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func dismissSelectionSuggestions() {
         selectionGeneration &+= 1
         selectedWord = nil
-        selectionPanel.hide()
-    }
-
-    private func scheduleSelectionSuggestions() {
-        dismissSelectionSuggestions()
-        let generation = selectionGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-            guard let self, self.selectionGeneration == generation,
-                  self.settings.selectionSuggestionsEnabled,
-                  self.engine.isRunning, AXIsProcessTrusted(), !SecureInput.isEnabled,
-                  !self.settings.isExcluded(self.engine.frontmostBundleID) else { return }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let selected = SelectedWord.capture(), selected.isCurrent() else { return }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.selectionGeneration == generation else { return }
-                    var choices = SelectionCandidates.make(
-                        for: selected.text, classifier: self.engine.classifier,
-                        preferred: self.layouts.currentLang,
-                        flip: self.layouts.flipText(selected.text)
-                    )
-                    // The word KeySwitch replaced comes first: selecting "беги" offers "баги" back.
-                    let recent = self.engine.recentCorrection(producing: selected.text)
-                    if let recent, recent.original != selected.text {
-                        choices = Array(([recent.original] + choices.filter { $0 != recent.original }).prefix(3))
-                    }
-                    guard !choices.isEmpty else { return }
-                    self.selectedWord = selected
-                    self.selectionPanel.show(options: choices, bounds: selected.bounds) { [weak self] choice in
-                        guard let self else { return }
-                        let restoring = recent.map { $0.original == choice } ?? false
-                        let switchTo = restoring && recent?.automatic == true && recent?.kind == .layout ? recent?.lang : nil
-                        if self.applySelectionSuggestion(choice, switchTo: switchTo), restoring, let recent {
-                            self.engine.remember(recent, source: .undo)
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Scheduled callers check selectionGeneration on main before reaching this point.
@@ -474,7 +428,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @discardableResult
     private func applySelectionSuggestion(_ choice: String, switchTo target: Lang? = nil) -> Bool {
         guard let selected = selectedWord, !SecureInput.isEnabled else { return false }
-        selectionPanel.hide()
         selectedWord = nil
         selectionGeneration &+= 1
         guard choice != selected.text else { NSSound.beep(); return false }

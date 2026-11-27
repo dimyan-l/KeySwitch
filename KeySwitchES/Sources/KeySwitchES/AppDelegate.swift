@@ -27,7 +27,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var clipboard = ClipboardHistory(store: store)
     private let settings = Settings.shared
     private let motion = MotionBadge()
-    private let selectionPanel = SelectionSuggestionPanel()
     private lazy var preferences = PreferencesWindowController(store: store) { model in
         AnyView(ApplicationProfilesView(model: model))
     }
@@ -57,10 +56,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         preferences.model.reload = { [weak self] in self?.loadDictionaries() }
         observe(NotificationCenter.default, .keySwitchClearClipboard) { [weak self] _ in self?.clipboard.clear() }
-        engine.onSuggestionKey = { [weak self] code, flags in
-            guard flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift, .maskSecondaryFn]).isEmpty else { return false }
-            return self?.selectionPanel.handleKey(code) ?? false
-        }
         statusItem = NSStatusBar.system.statusItem(withLength: 66)
         let menu = NSMenu()
         menu.delegate = self
@@ -113,7 +108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard !selectionPanel.isVisible else { return false }
         preferences.present()
         return false
     }
@@ -130,7 +124,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (center, token) in observers { center.removeObserver(token) }
         observers.removeAll()
         for monitor in selectionMonitors { NSEvent.removeMonitor(monitor) }
-        selectionPanel.hide()
         engine.stop()
         store.flushPendingWrites()
     }
@@ -342,11 +335,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             self?.learn(choice, from: plan)
                         }
                     }
-                    if plan.choices.count == 1 {
-                        apply(plan.choices[0])
-                    } else {
-                        self.selectionPanel.show(options: plan.choices, bounds: selected.bounds, onChoose: apply)
-                    }
+                    // No pop-up: the best variant is applied at once, another tap puts the word back.
+                    apply(plan.choices[0])
                 }
             }
         }
@@ -362,50 +352,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.dismissSelectionSuggestions()
         })
         if let down { selectionMonitors.append(down) }
-        let up = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp], handler: { [weak self] _ in
-            self?.scheduleSelectionSuggestions()
-        })
-        if let up { selectionMonitors.append(up) }
-        let keyUp = NSEvent.addGlobalMonitorForEvents(matching: [.keyUp], handler: { [weak self] event in
-            if event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Typer.marker,
-               event.modifierFlags.contains(.shift), (123...126).contains(event.keyCode) {
-                self?.scheduleSelectionSuggestions()
-            }
-        })
-        if let keyUp { selectionMonitors.append(keyUp) }
     }
 
     private func dismissSelectionSuggestions() {
         selectionGeneration &+= 1
         selectedWord = nil
-        selectionPanel.hide()
-    }
-
-    private func scheduleSelectionSuggestions() {
-        dismissSelectionSuggestions()
-        let generation = selectionGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-            guard let self, self.selectionGeneration == generation,
-                  self.settings.selectionSuggestionsEnabled,
-                  self.engine.isRunning, AXIsProcessTrusted(), !SecureInput.isEnabled,
-                  !self.settings.isExcluded(self.engine.frontmostBundleID) else { return }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let selected = SelectedWord.capture(), selected.isCurrent() else { return }
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.selectionGeneration == generation else { return }
-                    let language = self.layouts.currentLang
-                    let choices = SelectionCandidates.make(
-                        for: selected.text, classifier: self.engine.classifier, preferred: language,
-                        flip: language.map { self.layouts.flipText(selected.text, from: $0) }
-                    )
-                    guard !choices.isEmpty else { return }
-                    self.selectedWord = selected
-                    self.selectionPanel.show(options: choices, bounds: selected.bounds) { [weak self] choice in
-                        self?.applySelectionSuggestion(choice)
-                    }
-                }
-            }
-        }
     }
 
     /// Scheduled callers check selectionGeneration on main before reaching this point.
@@ -413,7 +364,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @discardableResult
     private func applySelectionSuggestion(_ choice: String, switchTo target: Lang? = nil) -> Bool {
         guard let selected = selectedWord, !SecureInput.isEnabled else { return false }
-        selectionPanel.hide()
         selectedWord = nil
         selectionGeneration &+= 1
         guard choice != selected.text else { NSSound.beep(); return false }
