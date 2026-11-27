@@ -102,7 +102,12 @@ struct CorrectionRecord: Codable, Equatable {
     let automatic: Bool
     let date: Date
 
-    var key: String { normalizeWord(replacement) }
+    static func lookupKey(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: CharacterSet.letters.inverted)
+        return normalizeWord(trimmed.isEmpty ? text : trimmed)
+    }
+
+    var key: String { Self.lookupKey(replacement) }
 }
 
 /// Persistent learned words and per-language exceptions for automatic changes.
@@ -277,19 +282,28 @@ final class UserStore {
 
     // MARK: - Replacement history (corrections.json)
 
+    private static let maxCorrections = 500
+
     func correction(producing text: String) -> CorrectionRecord? {
-        let key = normalizeWord(text)
+        let key = CorrectionRecord.lookupKey(text)
         return key.isEmpty ? nil : corrections[key]
     }
 
     func recordCorrection(_ record: CorrectionRecord) {
         corrections[record.key] = record
+        trimCorrectionsIfNeeded()
         saveCorrections()
     }
 
     func removeCorrection(producing text: String) {
-        guard corrections.removeValue(forKey: normalizeWord(text)) != nil else { return }
+        guard corrections.removeValue(forKey: CorrectionRecord.lookupKey(text)) != nil else { return }
         saveCorrections()
+    }
+
+    private func trimCorrectionsIfNeeded() {
+        guard corrections.count > Self.maxCorrections else { return }
+        let newest = corrections.values.sorted { $0.date > $1.date }.prefix(Self.maxCorrections)
+        corrections = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0) })
     }
 
     func clearCorrections() {
@@ -302,6 +316,7 @@ final class UserStore {
         do {
             let list = try JSONDecoder().decode([CorrectionRecord].self, from: Data(contentsOf: correctionsURL))
             for record in list.sorted(by: { $0.date < $1.date }) { corrections[record.key] = record }
+            trimCorrectionsIfNeeded()
         } catch {
             // Do not overwrite a file this version cannot read.
             canSaveCorrections = false

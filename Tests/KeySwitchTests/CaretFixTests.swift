@@ -98,4 +98,23 @@ final class CaretFixTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(CaretFix.plan(token: "привет", classifier: try classifier(), flip: flip)).choices,
                        ["ghbdtn"])
     }
+
+    func testCaretFixLearnsRareDictionaryCollisionAndRemembersNextTime() throws {
+        let c = try classifier()
+        // Before manual caret fix, "ns" ("ты") is held back by cautiousMode because "ns" is in en.tsv.
+        XCTAssertFalse(c.decide(current: "ns", alternative: "ты", currentLang: .en).confident)
+
+        let plan = try XCTUnwrap(CaretFix.plan(token: "ns", classifier: c, flip: flip))
+        XCTAssertEqual(plan.choices, ["ты"])
+        XCTAssertTrue(plan.learnFlip, "Rare dictionary junk should still allow learning the user's intended flip")
+
+        c.learn("ты", lang: .ru)
+        let afterLearn = c.decide(current: "ns", alternative: "ты", currentLang: .en)
+        XCTAssertTrue(afterLearn.convert && afterLearn.confident,
+                      "Once learned from a caret fix, the word must auto-switch even in cautiousMode")
+
+        // Accidental flip of a rare real word into unpronounceable gibberish must NOT set learnFlip.
+        let accidental = try XCTUnwrap(CaretFix.plan(token: "трос", classifier: c, flip: flip))
+        XCTAssertFalse(accidental.learnFlip, "Gibberish 'nhjc' must not be learned when flipping a rare real word")
+    }
 }

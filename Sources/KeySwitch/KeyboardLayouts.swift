@@ -94,6 +94,14 @@ final class KeyboardLayouts {
         if let lang = cur.lang, cur.layout != nil { preferred[lang] = cur }
     }
 
+    /// Updates the preferred source for the active language without re-enumerating TIS or
+    /// discarding cached reverse key maps unless an unknown layout ID appears.
+    func noteActiveSource(_ source: Source) {
+        guard let lang = source.lang, source.layout != nil else { return }
+        if preferred[lang]?.id == source.id { return }
+        preferred[lang] = source
+    }
+
     func current() -> Source {
         readSource()
     }

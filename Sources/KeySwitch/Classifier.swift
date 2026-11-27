@@ -29,6 +29,7 @@ final class LanguageModel {
     let letters: Set<Character>
     let wordChars: Set<Character>
     private(set) var words: [String: Float] = [:]
+    private(set) var learnedWords: Set<String> = []
     private var tri: [String: Float] = [:]
     private var ctx: [String: Float] = [:]
     private let vocabSize: Float
@@ -74,6 +75,17 @@ final class LanguageModel {
         let w = normalizeWord(raw)
         guard isWord(w) else { return }
         words[w] = max(words[w] ?? 0, score)
+    }
+
+    func addLearned(_ raw: String) {
+        let w = normalizeWord(raw)
+        guard isWord(w) else { return }
+        learnedWords.insert(w)
+        words[w] = max(words[w] ?? 0, Thresholds.learnedScore)
+    }
+
+    func isLearned(_ raw: String) -> Bool {
+        learnedWords.contains(normalizeWord(raw))
     }
 
     func trainNgrams() {
@@ -161,7 +173,7 @@ final class Classifier {
             if let userDir {
                 m.loadWordList(userDir.appendingPathComponent("my_\(lang.rawValue).txt"), score: Thresholds.customScore)
             }
-            for w in learned[lang] ?? [] { m.add(w, score: Thresholds.learnedScore) }
+            for w in learned[lang] ?? [] { m.addLearned(w) }
             m.trainNgrams()
             models[lang] = m
         }
@@ -169,7 +181,7 @@ final class Classifier {
     }
 
     func learn(_ word: String, lang: Lang) {
-        models[lang]?.add(word, score: Thresholds.learnedScore)
+        models[lang]?.addLearned(word)
     }
 
     func spellingInOtherLayout(current: String, alternative: String, currentLang: Lang) -> String? {
@@ -214,7 +226,8 @@ final class Classifier {
             }
             return Decision(convert: true, reason: "other-dict")
         case let (.some(c), .some(o)):
-            let favorsOther = o - c >= freqMargin
+            let learnedTarget = oth.isLearned(wo) && !cur.isLearned(wc)
+            let favorsOther = o - c >= freqMargin || (learnedTarget && c < 5.0 && o > c)
             // The frequency lists carry layout junk typed by others ("nfr" = "так", "dct" = "все").
             // A rare 3+ letter token whose other reading is a very common word is not ambiguous.
             // Length is the other reading's: in ",sk" = "был" the comma is a letter key.
@@ -222,9 +235,10 @@ final class Classifier {
             // at all ("'nj" = "это"), so the plain 100x margin is enough there.
             let punctuationSpellsWord = curNormalized.contains { !cur.letters.contains($0) }
                 && wo.count == normalizeWord(alternative).count
-            let clear = favorsOther && wo.count >= 3
+            let clearLearned = learnedTarget && favorsOther && wo.count >= 2 && c < 5.0
+            let clear = clearLearned || (favorsOther && wo.count >= 3
                 && ((o - c >= Thresholds.clearFreqMargin && c < Thresholds.rareScore)
-                    || (punctuationSpellsWord && c < Thresholds.rareScore + 0.5))
+                    || (punctuationSpellsWord && c < Thresholds.rareScore + 0.5)))
             return Decision(convert: favorsOther, reason: favorsOther ? "freq" : "both-dict", confident: clear)
         case (.none, .none):
             guard wo.count >= Thresholds.minNgramLength else {
